@@ -1,5 +1,9 @@
+import { redirect } from "next/navigation";
+import { eq } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { tenants } from "@/db/schema";
+import { getCurrentActor } from "@/lib/auth/session";
+import { logoutAction } from "@/app/auth-actions";
 import { Playground } from "@/components/Playground";
 import { ImportPanel } from "@/components/ImportPanel";
 import { ApprovalCard } from "@/components/ApprovalCard";
@@ -25,8 +29,10 @@ const STATUS_TONE: Record<string, string> = {
 };
 
 export default async function DashboardPage() {
+  const actor = await getCurrentActor();
+  if (!actor) redirect("/login");
   const db = await getDb();
-  const [tenant] = await db.select().from(tenants).limit(1);
+  const [tenant] = await db.select().from(tenants).where(eq(tenants.id, actor.tenantId)).limit(1);
 
   if (!tenant) {
     return (
@@ -34,19 +40,17 @@ export default async function DashboardPage() {
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-50">
           No business connected yet
         </h1>
-        <p className="text-zinc-600 dark:text-zinc-400">
-          Seed the demo shop to start exploring the task engine:
-        </p>
-        <code className="rounded-lg bg-zinc-900 px-4 py-2 font-mono text-sm text-emerald-400">
-          npm run db:seed
-        </code>
+        <p className="text-zinc-600 dark:text-zinc-400">Your business workspace could not be found. Please contact support.</p>
       </main>
     );
   }
 
+  const activitySince = new Date();
+  activitySince.setDate(activitySince.getDate() - 7);
+
   const [pending, activity, usage] = await Promise.all([
     listApprovalQueue(tenant.id),
-    recentActivity(tenant.id, new Date(Date.now() - 7 * 86_400_000)),
+    recentActivity(tenant.id, activitySince),
     summariseUsage(tenant.id),
   ]);
 
@@ -57,7 +61,8 @@ export default async function DashboardPage() {
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
       <header className="border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-6 py-4">
-          <div>
+          <div className="flex flex-wrap items-center gap-4">
+            <div>
             <h1 className="text-lg font-semibold">
               AfriAgent
               <span className="ml-2 text-sm font-normal text-zinc-500 dark:text-zinc-400">
@@ -68,6 +73,12 @@ export default async function DashboardPage() {
               {tenant.country} · {tenant.timezone} ·{" "}
               {tenant.currency}
             </p>
+            </div>
+            <div className="text-right">
+              <p className="text-sm font-medium">{actor.name}</p>
+              <p className="text-xs text-zinc-500">{actor.email}</p>
+              <form action={logoutAction}><button className="mt-1 text-xs font-semibold text-emerald-700 hover:underline" type="submit">Sign out</button></form>
+            </div>
           </div>
 
           {/* Billing is framed as subscription + overage, never as a running

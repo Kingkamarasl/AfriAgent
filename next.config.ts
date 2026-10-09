@@ -19,13 +19,17 @@ const nextConfig: NextConfig = {
     },
   },
 
-  // NOTE: `serverExternalPackages` is deliberately NOT used for
-  // @electric-sql/pglite or postgres. On Windows, Turbopack implements
-  // "external" in dev by creating a junction inside .next/dev/node_modules,
-  // which requires symlink privileges the OS does not grant by default --
-  // the dev server then dies with "Access is denied (os error 5)".
-  // `src/db/client.ts` loads both via a computed dynamic import instead,
-  // which the bundler leaves alone and Node resolves at runtime.
+  // PGlite is a WASM build of Postgres. It reads its own data directory via
+  // `import.meta.url`, so it must be a real Node module at runtime -- once
+  // Turbopack bundles it, that becomes a `URL` object where PGlite expects a
+  // path and every query fails with ERR_INVALID_ARG_TYPE.
+  //
+  // `serverExternalPackages` is the supported way to keep it external. On
+  // Windows Turbopack may implement that with a symlink, which needs
+  // Administrator or Developer Mode; if junction creation fails, run dev with
+  // `--webpack` (`npm run dev:webpack`), which externalises server
+  // dependencies without touching the filesystem.
+  serverExternalPackages: ["@electric-sql/pglite", "postgres"],
 };
 
 export default nextConfig;

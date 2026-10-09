@@ -54,8 +54,12 @@ export interface InboundContext {
   timestamp: Date;
   displayName?: string;
   phoneNumberId?: string;
-  /** Simulator-only escape hatch; ignored when a phone_number_id is present. */
-  tenantSlug?: string;
+  /**
+   * Simulator only. The tenant resolved from the caller's verified session --
+   * never anything supplied in the request body. `phoneNumberId` takes
+   * precedence and is the production path.
+   */
+  tenantId?: string;
 }
 
 export interface InboundOutcome {
@@ -368,6 +372,8 @@ export async function applyDeliveryStatus(update: {
 async function resolveTenant(ctx: InboundContext): Promise<Tenant | null> {
   const db = await getDb();
 
+  // Production: Meta tells us which number the message arrived on, and that
+  // number is bound to exactly one business. This is the authoritative path.
   if (ctx.phoneNumberId) {
     const [row] = await db
       .select({ tenant: tenants })
@@ -383,7 +389,23 @@ async function resolveTenant(ctx: InboundContext): Promise<Tenant | null> {
     return row?.tenant ?? null;
   }
 
-  // Simulator path: no phone_number_id, so use the single seeded tenant.
+  // Simulator: the caller supplies the tenant taken from its own verified
+  // session.
+  //
+  // This must NOT fall through to "first tenant in the table". With more than
+  // one registered business that silently resolves a signed-in user's
+  // simulated message into someone else's tenant -- the exact cross-tenant
+  // leak the session layer exists to prevent.
+  if (ctx.tenantId) {
+    const [row] = await db
+      .select()
+      .from(tenants)
+      .where(eq(tenants.id, ctx.tenantId))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // Dev fallback only: the single seeded demo shop.
   const [row] = await db.select().from(tenants).limit(1);
   return row ?? null;
 }

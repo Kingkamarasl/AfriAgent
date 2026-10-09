@@ -1,4 +1,4 @@
-import { requireActor } from "@/app/actions";
+import { requireManagerActor } from "@/app/actions";
 import { currentTotals, importCsv } from "@/domain/import";
 
 export const runtime = "nodejs";
@@ -22,7 +22,7 @@ export const dynamic = "force-dynamic";
 export async function POST(request: Request) {
   let tenantId: string;
   try {
-    ({ tenantId } = await requireActor());
+    ({ tenantId } = await requireManagerActor());
   } catch (error) {
     return Response.json(
       { error: error instanceof Error ? error.message : "Not authorised" },

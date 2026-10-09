@@ -8,7 +8,10 @@
  * Run with: npm run db:seed
  */
 import { getDb } from "./client";
+import { migrate } from "./migrate";
 import { DEFAULT_RATE_CARD } from "../domain/tasks";
+import { hashPassword } from "../lib/auth/password";
+import { DEMO_EMAIL, DEMO_PASSWORD } from "../lib/auth/demo";
 import {
   contacts,
   invoices,
@@ -58,7 +61,23 @@ function makeRng(seed: number) {
 }
 
 export async function seed() {
+  // This script DELETEs tenant data. Refuse to run it anywhere but a local
+  // PGlite directory unless someone explicitly opts in, because pointing
+  // DATABASE_URL at production and typing `npm run db:seed` is exactly the
+  // mistake that is unrecoverable.
+  if (process.env.DATABASE_URL && process.env.ALLOW_SEED_ON_DATABASE_URL !== "1") {
+    console.error(
+      "\nRefusing to seed: DATABASE_URL is set, and this script deletes tenant data.\n" +
+        "Set ALLOW_SEED_ON_DATABASE_URL=1 if you really mean to seed this database.\n",
+    );
+    process.exit(1);
+  }
+
   const db = await getDb();
+
+  // Explicit, not relying on the client's auto-migrate: this process is plain
+  // Node, where the file-based migrator works reliably.
+  await migrate();
 
   console.log("Seeding demo shop...");
 
@@ -96,6 +115,11 @@ export async function seed() {
       tenantId: tenant.id,
       name: "Ngozi Adeyemi",
       phone: OWNER_WA_ID,
+      // Without credentials the seeded shop becomes unreachable: the
+      // dashboard resolves the tenant from a session, so a freshly seeded
+      // demo has no way to be signed into and its sample data is invisible.
+      email: DEMO_EMAIL,
+      passwordHash: await hashPassword(DEMO_PASSWORD),
       role: "owner",
     })
     .returning();
@@ -104,6 +128,8 @@ export async function seed() {
     tenantId: tenant.id,
     name: "Ibrahim Musa (staff)",
     phone: "2348090000009",
+    email: "staff@ojota.local",
+    passwordHash: await hashPassword(DEMO_PASSWORD),
     role: "staff",
   });
 
@@ -242,12 +268,11 @@ export async function seed() {
   console.log(`  customers:${contactRows.length}`);
   console.log(`  orders:   ${insertedOrders.length}`);
   console.log("");
-  console.log("  Simulate an owner message with:");
-  console.log(`  curl -X POST http://localhost:3000/api/simulate/inbound \\`);
-  console.log(
-    `    -H "content-type: application/json" \\`,
-  );
-  console.log(`    -d '{"from":"${OWNER_WA_ID}","text":"Show me today's sales"}'`);
+  console.log("  Sign in at /login with:");
+  console.log(`    email:    ${DEMO_EMAIL}`);
+  console.log(`    password: ${DEMO_PASSWORD}`);
+  console.log("");
+  console.log("  (local demo credentials — never seed a real database)");
 }
 
 seed()

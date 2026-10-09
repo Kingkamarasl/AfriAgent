@@ -168,7 +168,8 @@ export async function verifyWebhookSignature(
   signatureHeader: string | null,
 ): Promise<boolean> {
   const secret = process.env.WHATSAPP_APP_SECRET;
-  if (!secret) return true; // Not configured -- dev convenience only.
+  // Local development may use the simulator, but production must fail closed.
+  if (!secret) return process.env.NODE_ENV !== "production";
 
   if (!signatureHeader) return false;
 

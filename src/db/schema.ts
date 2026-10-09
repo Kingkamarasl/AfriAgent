@@ -124,10 +124,11 @@ export const users = pgTable(
     name: text("name").notNull(),
     phone: text("phone"),
     email: text("email"),
+    passwordHash: text("password_hash"),
     role: userRole("role").notNull().default("staff"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index("users_tenant_idx").on(t.tenantId)],
+  (t) => [index("users_tenant_idx").on(t.tenantId), uniqueIndex("users_email_unique_idx").on(t.email)],
 );
 
 /**
@@ -151,6 +152,19 @@ export const whatsappLinks = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index("whatsapp_links_tenant_idx").on(t.tenantId)],
+);
+
+/** Opaque, hashed session tokens. Raw tokens are only held in HttpOnly cookies. */
+export const authSessions = pgTable(
+  "auth_sessions",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("auth_sessions_token_hash_idx").on(t.tokenHash), index("auth_sessions_user_idx").on(t.userId)],
 );
 
 /* ------------------------------------------------------------------ */

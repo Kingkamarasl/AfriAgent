@@ -15,6 +15,13 @@
       "when": 1791537144685,
       "tag": "0001_wakeful_black_cat",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791541462494,
+      "tag": "0002_real_auth_sessions",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,5 @@
-import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
+import { drizzle as drizzlePglite, type PgliteDatabase } from "drizzle-orm/pglite";
+import path from "node:path";
 import { migrate as migratePglite } from "drizzle-orm/pglite/migrator";
 import { drizzle as drizzlePostgres } from "drizzle-orm/postgres-js";
 import { migrate as migratePostgres } from "drizzle-orm/postgres-js/migrator";
@@ -19,6 +20,13 @@ import * as schema from "./schema";
  */
 
 export const isLocalPglite = !process.env.DATABASE_URL;
+
+/**
+ * Absolute, so the migrator does not depend on the process working
+ * directory. Next sets `process.cwd()` to the project root, but some
+ * serverless runtimes do not.
+ */
+const MIGRATIONS_DIR = path.resolve(process.cwd(), "drizzle");
 
 /**
  * The driver packages are loaded through a *computed* specifier on purpose.
@@ -56,23 +64,47 @@ async function buildPostgres() {
     max: 10,
     prepare: false, // Required by poolers (PgBouncer, Neon, Supabase).
   });
-  return drizzlePostgres(client, { schema });
+  // Cast is deliberate: see the `Database` type below.
+  return drizzlePostgres(client, { schema }) as unknown as Database;
 }
 
-export type Database = Awaited<ReturnType<typeof buildPglite>> | Awaited<ReturnType<typeof buildPostgres>>;
+/**
+ * A single type, not a union of the two drivers.
+ *
+ * Drizzle's query-builder API is identical across both, so modelling this as
+ * `Pglite | PostgresJs` buys nothing and costs a great deal: TypeScript cannot
+ * resolve a union of generic methods, so `db.transaction(...)` degrades `tx`
+ * to a shape where `.returning({ id })` type-checks as a 0-arg call. The
+ * union is collapsed once, here, at the boundary.
+ */
+export type Database = PgliteDatabase<typeof schema>;
 
 async function connect(): Promise<Database> {
   const db = await (isLocalPglite ? buildPglite() : buildPostgres());
 
-  if (process.env.SKIP_AUTO_MIGRATE === "1") return db;
-
-  const runner = (
-    isLocalPglite ? migratePglite : migratePostgres
-  ) as unknown as (d: unknown, opts: { migrationsFolder: string }) => Promise<unknown>;
-
-  // Drizzle's migrator takes its own migration lock, so several instances
-  // booting at once is fine.
-  await runner(db, { migrationsFolder: "./drizzle" });
+  if (process.env.SKIP_AUTO_MIGRATE !== "1") {
+    try {
+      const runner = (
+        isLocalPglite ? migratePglite : migratePostgres
+      ) as unknown as (d: unknown, opts: { migrationsFolder: string }) => Promise<unknown>;
+      await runner(db, { migrationsFolder: MIGRATIONS_DIR });
+    } catch (error) {
+      // Expected inside the Next server runtime: drizzle's file-based
+      // migrator reads the migration directory through `node:fs`, and once
+      // Turbopack bundles that module a URL instance reaches the polyfill,
+      // which throws ERR_INVALID_ARG_TYPE. Migrations are therefore applied
+      // out-of-band by `npm run db:migrate` / `npm run db:seed`.
+      //
+      // Failing loudly-but-not-fatally keeps a stale dev database usable while
+      // pointing at the actual fix. It is NOT a silent fallback: if the
+      // schema really is behind, the next query fails loudly on the missing
+      // column rather than quietly serving wrong data.
+      console.warn(
+        `\n[db] auto-migrate skipped inside the Next runtime (${(error as Error)?.message?.slice(0, 80) ?? "unknown error"}).` +
+          `\n[db] Run \`npm run db:migrate\` (or \`npm run db:seed\`) from a separate process.\n`,
+      );
+    }
+  }
 
   return db;
 }

@@ -1,6 +1,7 @@
 import { nanoid } from "nanoid";
 import { z } from "zod";
 import { handleInboundMessage } from "@/domain/pipeline";
+import { getCurrentActor } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 
@@ -13,19 +14,22 @@ export const runtime = "nodejs";
  *     -H "content-type: application/json" \
  *     -d '{"from":"2348010000001","text":"Show me today\u2019s sales"}'
  *
- * The seeded owner's wa_id is 2348010000001. Any other number is treated as
- * a customer of the shop, which is how you exercise the support flow.
+ * Requires a signed-in development account. The tenant is derived from that
+ * session; callers cannot choose another tenant in the request body.
  */
 
 const inboundSchema = z.object({
   from: z.string().min(4).optional(),
   text: z.string().min(1).max(4096),
   name: z.string().optional(),
-  /** Set only if you have seeded more than one tenant. */
-  tenantSlug: z.string().optional(),
 });
 
 export async function POST(request: Request) {
+  if (process.env.NODE_ENV === "production") {
+    return Response.json({ error: "Simulator is disabled in production" }, { status: 404 });
+  }
+  const actor = await getCurrentActor();
+  if (!actor) return Response.json({ error: "Sign in required" }, { status: 401 });
   const parsed = inboundSchema.safeParse(await request.json().catch(() => null));
 
   if (!parsed.success) {
@@ -42,14 +46,14 @@ export async function POST(request: Request) {
     messageId: `wamid.SIM.${nanoid()}`,
     timestamp: new Date(),
     displayName: body.name,
-    tenantSlug: body.tenantSlug,
+    // Tenant is resolved from the authenticated session, never from request JSON.
+    tenantId: actor.tenantId,
   });
 
   if (!outcome.tenantId) {
     return Response.json(
       {
-        error:
-          "No tenant found. Run `npm run db:seed` first, or pass tenantSlug.",
+        error: "The authenticated business workspace could not be resolved.",
       },
       { status: 404 },
     );
@@ -66,6 +70,9 @@ export async function POST(request: Request) {
 
 /** Suggested messages, so the playground has something to click. */
 export async function GET() {
+  if (process.env.NODE_ENV === "production") {
+    return Response.json({ error: "Simulator is disabled in production" }, { status: 404 });
+  }
   return Response.json({
     ownerWaId: "2348010000001",
     customerWaId: "2348020000002",

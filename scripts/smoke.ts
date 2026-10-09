@@ -8,9 +8,9 @@
  * that delivery is what gets billed, and that the state machine refuses
  * shortcuts. Each one is asserted, not just exercised.
  */
-import { eq } from "drizzle-orm";
+import { eq, like } from "drizzle-orm";
 import { getDb } from "../src/db/client";
-import { messages, tenants, usageLedger, users } from "../src/db/schema";
+import { messages, tasks, tenants, usageLedger, users } from "../src/db/schema";
 import { sendTask, handleInboundMessage } from "../src/domain/pipeline";
 import {
   approveTask,
@@ -25,7 +25,11 @@ import {
 import { IncoherentRateCardError, InvalidTransitionError, DEFAULT_RATE_CARD, assertRateCardCoherent, requiresApprovalFor } from "../src/domain/tasks";
 import { importCsv, parseDate } from "../src/domain/import";
 import { runDailySummaries } from "../src/domain/scheduler";
-import { parseCsv } from "../src/lib/csv";
+import {
+  parseCsv,
+} from "../src/lib/csv";
+import { verifyPassword } from "../src/lib/auth/password";
+import { DEMO_PASSWORD } from "../src/lib/auth/demo";
 
 let passed = 0;
 let failed = 0;
@@ -160,12 +164,15 @@ async function main() {
       `recipients: ${delivery?.recipients?.length ?? 0}`,
     );
 
-    const outboundTemplates = await db
-      .select({ templateName: messages.templateName })
-      .from(messages)
-      .where(eq(messages.tenantId, tenant.id));
+    // Scoped to this task via the dedupe key, otherwise template sends left
+    // by earlier runs are counted too.
+    const chased = (
+      await db
+        .select({ templateName: messages.templateName })
+        .from(messages)
+        .where(like(messages.dedupeKey, `${invoiceTask.id}:%`))
+    ).filter((m) => m.templateName === "invoice_reminder").length;
 
-    const chased = outboundTemplates.filter((m) => m.templateName === "invoice_reminder").length;
     check(
       "each chased customer got an invoice_reminder template",
       chased === (delivery?.recipients?.length ?? 0) && chased > 0,
@@ -288,10 +295,14 @@ async function main() {
   );
 
   /* -- 10. CSV import is safe and idempotent --------------------------- */
+  // Unique per run so the suite is re-runnable against a database that
+  // already has a previous run's rows in it.
+  const runTag = crypto.randomUUID().slice(0, 8);
+
   const messy = [
     "sku,name,unit,stock,reorder_level,unit_price",
-    'SMK-1,"Bread, sliced and seeded",loaf,4,8,650', // comma inside quotes
-    "SMK-2,Milk powder,tin,3,12,4200",
+    `SMK1-${runTag},"Bread, sliced and seeded",loaf,4,8,650`, // comma inside quotes
+    `SMK2-${runTag},Milk powder,tin,3,12,4200`,
     "",
   ].join("\r\n"); // CRLF, like Excel on Windows
 
@@ -299,8 +310,8 @@ async function main() {
   check("CSV parser keeps quoted commas intact", parsed[1]?.[1] === "Bread, sliced and seeded");
   check("CSV parser handles CRLF", parsed.length === 3, `${parsed.length} rows`);
 
-  const bom = "\uFEFFsku,name\r\nSMK-3,Thing\r\n";
-  check("CSV parser strips the Excel BOM", parseCsv(bom)[1]?.[0] === "SMK-3");
+  const bom = "\uFEFFsku,name\r\nSMK3-MILK.csv-test,Thing\r\n";
+  check("CSV parser strips the Excel BOM", parseCsv(bom)[1]?.[0] === "SMK3-MILK.csv-test");
 
   // Day-first: African shops write 03/04 as 3 April, not 4 March.
   const dayFirst = parseDate("03/04/2026");
@@ -336,6 +347,9 @@ async function main() {
   check("a file with structural errors imports nothing", broken.errors.length > 0 && broken.created === 0);
 
   /* -- 11. The daily summary runs once, not twice --------------------- */
+  // Clear any summary from an earlier run so "ran" is deterministic.
+  await db.delete(tasks).where(eq(tasks.kind, "daily_summary"));
+
   const firstRun = await runDailySummaries();
   const summaryRun = firstRun.find((r) => r.tenantId === tenant.id);
   check("daily summary ran", summaryRun?.status === "ran", summaryRun?.reason);
@@ -346,6 +360,75 @@ async function main() {
     "re-running the cron the same day is a no-op",
     repeat?.status === "skipped",
     `got ${repeat?.status}`,
+  );
+
+  /* -- 12. Cross-tenant isolation ------------------------------------- */
+  // The simulator used to ignore the tenant supplied by the caller's session
+  // and fall back to "first tenant in the table". With two registered
+  // businesses that routes one shop's simulated message into another's data.
+  // Runs last so the extra tenant cannot disturb the assertions above.
+  const [other] = await db
+    .insert(tenants)
+    .values({ name: "Second Shop", slug: `second-${crypto.randomUUID().slice(0, 6)}`, country: "KE", currency: "KES", timezone: "Africa/Nairobi" })
+    .returning();
+
+  const otherOwnerWaId = "2348099999999";
+  await db.insert(users).values({ tenantId: other.id, name: "Other Owner", phone: otherOwnerWaId, role: "owner" });
+
+  const tasksBefore = (await db.select({ id: tasks.id }).from(tasks).where(eq(tasks.tenantId, tenant.id))).length;
+
+  const crossTenant = await handleInboundMessage({
+    waId: otherOwnerWaId,
+    body: "Show me today's sales",
+    messageId: `wamid.SMOKE.${crypto.randomUUID()}`,
+    timestamp: new Date(),
+    tenantId: other.id,
+  });
+
+  check(
+    "a message for tenant B resolves tenant B, not tenant A",
+    crossTenant.tenantId === other.id,
+    `resolved to ${crossTenant.tenantId.slice(0, 8)}`,
+  );
+
+  const leaked = await db.select().from(tasks).where(eq(tasks.tenantId, tenant.id));
+  check(
+    "no task leaks into the other tenant",
+    leaked.length === tasksBefore,
+    `${tasksBefore} -> ${leaked.length}`,
+  );
+
+  const landed = await db.select().from(tasks).where(eq(tasks.tenantId, other.id));
+  check("the task landed in tenant B", landed.length > 0, `${landed.length} tasks`);
+
+  await db.delete(tenants).where(eq(tenants.id, other.id)); // cascades
+
+  /* -- 13. The documented quick start actually works ------------------ */
+  // The dashboard resolves its tenant from a session, so a seeded demo shop
+  // with no credentials is unreachable and its sample data is invisible.
+  const [seededOwner] = await db
+    .select({ email: users.email, passwordHash: users.passwordHash })
+    .from(users)
+    .where(eq(users.tenantId, tenant.id))
+    .limit(1);
+
+  check(
+    "the seeded owner has credentials to sign in with",
+    Boolean(seededOwner?.email && seededOwner?.passwordHash),
+  );
+  check(
+    "the documented demo password verifies",
+    Boolean(
+      seededOwner?.passwordHash &&
+        (await verifyPassword(DEMO_PASSWORD, seededOwner.passwordHash)),
+    ),
+  );
+  check(
+    "a wrong password does not verify",
+    Boolean(
+      seededOwner?.passwordHash &&
+        !(await verifyPassword("not-the-password", seededOwner.passwordHash)),
+    ),
   );
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

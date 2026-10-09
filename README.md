@@ -36,6 +36,18 @@ inbound WhatsApp message
   -> deliver, meter, audit
 ```
 
+## Current readiness status
+
+This repository is still a pre-launch prototype, not ready for public production use.
+It now includes email/password registration and login, PBKDF2 password hashing,
+opaque database-backed sessions in HttpOnly cookies, and dashboard tenant
+resolution from the verified session. Email verification, password reset,
+login rate limiting, team invitations/role management, durable webhook processing,
+provider-backed AI, billing reconciliation, and production operations are still
+required before public launch. WhatsApp webhook requests are rejected unless
+`WHATSAPP_APP_SECRET` is set. Run typecheck, lint, smoke tests, and a production
+build in a clean environment before deployment.
+
 ## Quick start
 
 ```bash
@@ -46,18 +58,33 @@ npm run dev         # http://localhost:3000
 
 No database or Meta account needed — see [Zero-setup dev](#zero-setup-dev).
 
+Sign in at `/login` with the demo credentials printed by `db:seed`:
+
+```
+email:    owner@ojota.local
+password: afriagent-demo-2026
+```
+
+`db:seed` refuses to run when `DATABASE_URL` is set, because it deletes tenant
+data. Override with `ALLOW_SEED_ON_DATABASE_URL=1` if you really mean it.
+
 Then open the dashboard and either use the **WhatsApp simulator** on the left, or:
 
 ```bash
 curl -X POST http://localhost:3000/api/simulate/inbound \
   -H "content-type: application/json" \
-  -d '{"from":"2348010000001","text":"Show me today'\''s sales"}'
+  -d '{"from":"2348010000001","text":"Show me today'\''s sales"}' \
+  -b cookies.txt
 ```
+
+The simulator requires a signed-in session and is disabled in production. Use
+the dashboard UI rather than curl unless you are also sending the session
+cookie.
 
 Run the guarantees end to end:
 
 ```bash
-npm run smoke      # 20 assertions
+npm run smoke      # 46 assertions, re-runnable
 ```
 
 ## Zero-setup dev
@@ -65,18 +92,30 @@ npm run smoke      # 20 assertions
 | Concern | In development | In production |
 | --- | --- | --- |
 | Database | PGlite — real Postgres compiled to WASM, in-process, on disk at `.data/` | Postgres via `DATABASE_URL` (Neon, Supabase, self-hosted) |
-| Migrations | Applied automatically on connect | Same, or `SKIP_AUTO_MIGRATE=1` |
+| Migrations | `npm run db:migrate` / `db:seed`, out of process | `npm run db:migrate` before start |
 | WhatsApp | Simulator — logs the exact payload it would have sent | Meta WhatsApp Cloud API |
-| Auth | Seeded owner | Your session provider |
+| Auth | Email/password registration and login | Same |
 
 Both databases share one migration history, so the SQL you test against locally
 is the SQL that runs in production. Setting `DATABASE_URL` is the only switch.
 
-> **Windows note.** PGlite and `postgres` are loaded via a computed dynamic
-> import rather than `serverExternalPackages`. Turbopack implements "external"
-> on Windows by creating a symlink under `.next/dev/node_modules`, which this
-> OS refuses without Administrator or Developer Mode, and the dev server dies
-> with a Turbopack panic. See the comment in `src/db/client.ts`.
+### Migrations run out of process, on purpose
+
+The app does not migrate itself. Drizzle's file-based migrator reads the
+migration directory through `node:fs`, and once Turbopack bundles that module a
+`URL` instance reaches the polyfill and the migrator throws
+`ERR_INVALID_ARG_TYPE`. PGlite itself hits the same problem — it resolves its
+own data directory via `import.meta.url`.
+
+So `npm run db:migrate` is a separate `tsx` process, and the app warns and
+points at it if the schema looks unmigrated. `db:seed` migrates first, so the
+documented `db:seed && dev` flow needs no extra step.
+
+> **Windows note.** PGlite and `postgres` are declared in
+> `serverExternalPackages` because they must be real Node modules at runtime.
+> If Turbopack cannot create the junction it needs and the dev server dies with
+> "Access is denied (os error 5)", run `npm run dev:webpack` — Webpack
+> externalises server dependencies without touching the filesystem.
 
 ## Scripts
 
@@ -87,12 +126,9 @@ is the SQL that runs in production. Setting `DATABASE_URL` is the only switch.
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run smoke` | Asserts the product guarantees (see below) |
 | `npm run db:seed` | Seed the demo shop (idempotent) |
+| `npm run db:migrate` | Apply migrations (separate process — see below) |
 | `npm run db:generate` | Generate migrations from the schema |
 | `npm run db:studio` | Browse the database |
-
-Migrations apply automatically on first connection, so `npm run dev` is always
-in step with `src/db/schema.ts`. Set `SKIP_AUTO_MIGRATE=1` to manage them
-yourself.
 
 ## Getting data in
 
@@ -176,6 +212,8 @@ exercising code paths:
 - the CSV parser survives BOM, CRLF and quoted commas; dates are day-first
 - an import with structural errors writes nothing
 - the daily summary runs once, not twice
+- **a simulated message for tenant B lands in tenant B, never tenant A**
+- the seeded owner can actually sign in with the documented password
 - every transition lands in the audit log
 
 ## Connecting real WhatsApp
@@ -271,9 +309,10 @@ validation, scheduled daily summary.
 
 **Stubbed / not built yet:**
 
-- **Auth.** `requireActor()` returns the seeded owner. Replace with a real
-  session and verify role *and* tenant on every call — before shipping. This
-  is still the biggest risk in the codebase.
+- **Auth.** Email/password login and database-backed sessions are implemented,
+  but email verification, password reset, login throttling, MFA, and team
+  membership management remain launch blockers. The simulator derives its
+  tenant from the authenticated session, not request data.
 - **Intent routing is regex, not an LLM.** Deliberately: every branch is
   testable and behaviour is identical with or without an API key. To swap in a
   model, replace the body of `routeMessage` with a tool-call loop returning the

@@ -1,9 +1,8 @@
 "use server";
 
-import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { getDb } from "@/db/client";
-import { tenants, users } from "@/db/schema";
+import { getCurrentActor } from "@/lib/auth/session";
 import { handleInboundMessage, sendTask } from "@/domain/pipeline";
 import {
   approveTask,
@@ -28,28 +27,18 @@ export interface ActionResult {
   error?: string;
 }
 
-/**
- * Resolves who is acting.
- *
- * PLACEHOLDER: with no auth layer this returns the seeded owner. Before this
- * ships, replace with a real session lookup and verify the actor's role AND
- * tenant on every call -- a dashboard that lets any authenticated user approve
- * another business's messages is the worst possible bug in this product.
- */
-export async function requireActor(): Promise<{
-  userId: string;
-  tenantId: string;
-}> {
-  const db = await getDb();
-  const [row] = await db
-    .select({ id: users.id, tenantId: users.tenantId })
-    .from(users)
-    .innerJoin(tenants, eq(users.tenantId, tenants.id))
-    .where(eq(users.role, "owner"))
-    .limit(1);
+/** Resolve the actor from a verified, server-side session. */
+export async function requireActor(): Promise<{ userId: string; tenantId: string; role: "owner" | "manager" | "staff" }> {
+  const actor = await getCurrentActor();
+  if (!actor) throw new Error("Please sign in to continue.");
+  return { userId: actor.userId, tenantId: actor.tenantId, role: actor.role };
+}
 
-  if (!row) throw new Error("No owner user found. Run `npm run db:seed`.");
-  return { userId: row.id, tenantId: row.tenantId };
+/** Only owners/managers may approve, reject, edit or retry consequential tasks. */
+export async function requireManagerActor(): Promise<{ userId: string; tenantId: string; role: "owner" | "manager" }> {
+  const actor = await requireActor();
+  if (actor.role !== "owner" && actor.role !== "manager") throw new Error("You need owner or manager access to perform this action.");
+  return { userId: actor.userId, tenantId: actor.tenantId, role: actor.role };
 }
 
 /** Guard against cross-tenant approval. */
@@ -66,7 +55,7 @@ export async function approveAndSendAction(
   taskId: string,
 ): Promise<ActionResult> {
   try {
-    const { userId, tenantId } = await requireActor();
+    const { userId, tenantId } = await requireManagerActor();
     await assertOwnership(taskId, tenantId);
 
     await approveTask(taskId, userId);
@@ -87,7 +76,7 @@ export async function rejectAction(
   formData: FormData,
 ): Promise<ActionResult> {
   try {
-    const { userId, tenantId } = await requireActor();
+    const { userId, tenantId } = await requireManagerActor();
     await assertOwnership(taskId, tenantId);
 
     const reason = String(formData.get("reason") ?? "").trim();
@@ -108,7 +97,7 @@ export async function reviseDraftAction(
   formData: FormData,
 ): Promise<ActionResult> {
   try {
-    const { userId, tenantId } = await requireActor();
+    const { userId, tenantId } = await requireManagerActor();
     await assertOwnership(taskId, tenantId);
 
     const draft = String(formData.get("draft") ?? "").trim();
@@ -133,7 +122,7 @@ export async function reviseDraftAction(
 
 export async function retryAction(taskId: string): Promise<ActionResult> {
   try {
-    const { tenantId } = await requireActor();
+    const { tenantId } = await requireManagerActor();
     const task = await assertOwnership(taskId, tenantId);
 
     if (task.status !== "failed") {
@@ -164,11 +153,15 @@ export async function simulateInboundAction(
   from: string,
 ): Promise<{ ok: boolean; error?: string; taskCount?: number; role?: string }> {
   try {
+    if (process.env.NODE_ENV === "production") return { ok: false, error: "The simulator is available in development only." };
+    const actor = await getCurrentActor();
+    if (!actor) return { ok: false, error: "Please sign in to continue." };
     const outcome = await handleInboundMessage({
       waId: from,
       body: text,
       messageId: `wamid.SIM.${nanoid()}`,
       timestamp: new Date(),
+      tenantId: actor.tenantId,
     });
 
     revalidatePath("/", "layout");
