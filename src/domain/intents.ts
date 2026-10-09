@@ -1,0 +1,207 @@
+import type { TaskKind } from "@/db/schema";
+
+/* ------------------------------------------------------------------ */
+/* Sender role resolution                                               */
+/* ------------------------------------------------------------------ */
+
+export type SenderRole =
+  | { role: "owner"; userId: string }
+  | { role: "customer"; contactId: string }
+  | { role: "unknown" };
+
+/**
+ * Two very different conversations arrive on the same WhatsApp number:
+ *
+ *   owner    -> "Show me today's sales"      (a command for the business)
+ *   customer -> "Do you have milk in stock?" (support for the shop's customers)
+ *
+ * The owner's phone matches a `users.phone` row for the tenant; everyone else
+ * is a customer of that shop. Getting this wrong means a customer's "what's
+ * the price of rice" gets answered with the owner's revenue figures, so it is
+ * resolved explicitly before any routing happens.
+ */
+export function resolveSenderRole(args: {
+  waId: string;
+  owners: Array<{ id: string; phone: string | null }>;
+  contactsByWaId: Map<string, string>;
+}): SenderRole {
+  const normalized = normalisePhone(args.waId);
+
+  for (const owner of args.owners) {
+    if (owner.phone && normalisePhone(owner.phone) === normalized) {
+      return { role: "owner", userId: owner.id };
+    }
+  }
+
+  const contactId = args.contactsByWaId.get(normalized);
+  if (contactId) return { role: "customer", contactId };
+  return { role: "unknown" };
+}
+
+/** WhatsApp wa_ids arrive in a few shapes; compare on trailing digits. */
+export function normalisePhone(raw: string): string {
+  return raw.replace(/[^\d]/g, "").slice(-12);
+}
+
+/* ------------------------------------------------------------------ */
+/* Owner command routing                                                */
+/* ------------------------------------------------------------------ */
+
+export interface PlannedTask {
+  kind: TaskKind;
+  title: string;
+  requestText: string;
+  input: Record<string, unknown>;
+}
+
+interface Rule {
+  kind: TaskKind;
+  title: string;
+  test: RegExp;
+  input?: Record<string, unknown>;
+}
+
+/**
+ * Ordered: first match wins, so the more specific patterns sit above the
+ * broader ones. Purely deterministic for now -- every branch is covered by
+ * tests and the behaviour is identical with or without an LLM configured.
+ *
+ * Swapping in a model classifier later means replacing `routeMessage`'s body
+ * with a tool-call loop and returning the same `PlannedTask[]`. Nothing
+ * downstream changes.
+ */
+const OWNER_RULES: Rule[] = [
+  {
+    kind: "handoff",
+    title: "Hand off to a human",
+    test: /\b(human|person|real person|actual person|agent|speak to (someone|a human)|manager|supervisor)\b/i,
+  },
+  {
+    kind: "sales_report",
+    title: "Sales report",
+    test: /\b(sales|revenue|turnover|what did i (make|sell)|how much did i|total sales|takings)\b/i,
+  },
+  {
+    kind: "invoice_reminder",
+    title: "Chase overdue invoices",
+    test: /\b(invoice|invoices|overdue|unpaid|outstanding|debt|debts|owe|owe me|payment|chase)\b/i,
+  },
+  {
+    kind: "low_stock",
+    title: "Low stock report",
+    test: /\b(low stock|running out|running low|stock level|inventory|what.?s left|out of stock|remaining)\b/i,
+  },
+  {
+    kind: "daily_summary",
+    title: "Daily summary",
+    test: /\b(summary|digest|brief me|briefing|how are we doing|update me|catch me up|status)\b/i,
+  },
+  {
+    kind: "appointment_book",
+    title: "Book appointment",
+    test: /\b(book|appointment|schedule|slot|booking|reservation)\b/i,
+  },
+  {
+    kind: "order_create",
+    title: "Create order",
+    test: /\b(order|place an order|new order|record (a )?(sale|order))\b/i,
+  },
+];
+
+/**
+ * Split a multi-intent message into clauses.
+ *
+ * "Show me today's sales, remind overdue invoices and tell me what's running
+ *  low" is three Tasks, not one -- and it is billed as three.
+ *
+ * Splits on comma / "and also" / " and " / bullet markers, but not on "and"
+ * when it is clearly internal to a clause ("bread and milk").
+ */
+export function splitIntents(text: string): string[] {
+  return text
+    .split(/\s*(?:,\s*(?:and\s+)?|\band also\b|\band then\b|;|\n+|\s•\s)\s*/i)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 2)
+    .filter((s, _i, all) => !_isFragmentOfPrevious(s, all));
+}
+
+function _isFragmentOfPrevious(fragment: string, all: string[]): boolean {
+  const idx = all.indexOf(fragment);
+  if (idx <= 0) return false;
+  // Keep short tails like "and low stock" attached to the clause before them.
+  return fragment.split(/\s+/).length <= 4 && idx === all.length - 1;
+}
+
+export function routeMessage(text: string): PlannedTask[] {
+  const clauses = splitIntents(text);
+  const planned: PlannedTask[] = [];
+  const seen = new Set<TaskKind>();
+
+  for (const clause of clauses.length ? clauses : [text]) {
+    const rule = OWNER_RULES.find((r) => r.test.test(clause));
+    if (!rule || seen.has(rule.kind)) continue;
+    seen.add(rule.kind);
+    planned.push({
+      kind: rule.kind,
+      title: rule.title,
+      requestText: clause,
+      input: rule.input ?? {},
+    });
+  }
+
+  if (planned.length === 0) {
+    planned.push({
+      kind: "unknown",
+      title: "Unrecognised request",
+      requestText: text,
+      input: {},
+    });
+  }
+
+  return planned;
+}
+
+/* ------------------------------------------------------------------ */
+/* Customer support routing                                             */
+/* ------------------------------------------------------------------ */
+
+const CUSTOMER_RULES: Rule[] = [
+  {
+    kind: "appointment_book",
+    title: "Appointment request",
+    test: /\b(book|appointment|schedule|slot|booking|available)\b/i,
+  },
+  {
+    kind: "low_stock",
+    title: "Availability question",
+    test: /\b(do you have|have you got|in stock|available|stock)\b/i,
+  },
+  {
+    kind: "invoice_reminder",
+    title: "Invoice enquiry",
+    test: /\b(my invoice|invoice|payment|owe|balance|receipt)\b/i,
+  },
+  {
+    kind: "handoff",
+    title: "Request for a human",
+    test: /\b(human|person|agent|manager|talk to someone)\b/i,
+  },
+];
+
+/**
+ * Customer messages become tasks too, but they are *support* tasks: the agent
+ * drafts a reply, and anything that commits the shop to a price, a discount
+ * or a booking still routes through approval.
+ */
+export function routeCustomerMessage(text: string): PlannedTask {
+  const rule = CUSTOMER_RULES.find((r) => r.test.test(text));
+  if (!rule) {
+    return {
+      kind: "customer_question",
+      title: "Customer question",
+      requestText: text,
+      input: {},
+    };
+  }
+  return { kind: rule.kind, title: rule.title, requestText: text, input: {} };
+}

@@ -6,21 +6,33 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:seed": "tsx src/db/seed.ts",
+    "db:studio": "drizzle-kit studio",
+    "smoke": "tsx scripts/smoke.ts"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "drizzle-orm": "^0.45.4",
+    "nanoid": "^6.0.2",
     "next": "16.4.0",
+    "postgres": "^3.4.9",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "drizzle-kit": "^0.31.11",
     "eslint": "^9",
     "eslint-config-next": "16.4.0",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }
