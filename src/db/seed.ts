@@ -8,7 +8,7 @@
  * Run with: npm run db:seed
  */
 import { getDb } from "./client";
-import { migrate } from "./migrate";
+import { DEFAULT_RATE_CARD } from "../domain/tasks";
 import {
   contacts,
   invoices,
@@ -59,7 +59,6 @@ function makeRng(seed: number) {
 
 export async function seed() {
   const db = await getDb();
-  await migrate();
 
   console.log("Seeding demo shop...");
 
@@ -85,8 +84,9 @@ export async function seed() {
       country: "NG",
       currency: CURRENCY,
       timezone: "Africa/Lagos",
-      planMonthlyMinor: naira(15_000),
-      includedUnits: 200,
+      planMonthlyMinor: DEFAULT_RATE_CARD.planMonthlyMinor,
+      includedUnits: DEFAULT_RATE_CARD.includedUnits,
+      overageRateMinor: DEFAULT_RATE_CARD.overageRateMinor,
     })
     .returning();
 

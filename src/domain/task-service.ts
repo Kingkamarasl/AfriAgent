@@ -13,7 +13,7 @@ import {
   assertTransition,
   BILLABLE_UNITS,
   billingPeriod,
-  DEFAULT_PRICE_PER_UNIT_MINOR,
+  DEFAULT_RATE_CARD,
   requiresApprovalFor,
 } from "./tasks";
 
@@ -230,7 +230,7 @@ export async function markFailed(taskId: string, error: string): Promise<Task> {
  * Guarded by a uniqueness check on (task_id) so a retried delivery cannot
  * double-charge the business.
  */
-export async function recordUsage(task: Task, pricePerUnit?: number): Promise<void> {
+export async function recordUsage(task: Task, rateMinor?: number): Promise<void> {
   const db = await getDb();
 
   const [existing] = await db
@@ -241,12 +241,22 @@ export async function recordUsage(task: Task, pricePerUnit?: number): Promise<vo
   if (existing) return;
 
   const [tenant] = await db
-    .select({ planMonthlyMinor: tenants.planMonthlyMinor })
+    .select({
+      planMonthlyMinor: tenants.planMonthlyMinor,
+      includedUnits: tenants.includedUnits,
+      overageRateMinor: tenants.overageRateMinor,
+    })
     .from(tenants)
     .where(eq(tenants.id, task.tenantId))
     .limit(1);
 
-  const rate = pricePerUnit ?? DEFAULT_PRICE_PER_UNIT_MINOR;
+  // The ledger stores the unit price *at the time of the task*. If the rate
+  // card changes mid-period, last month's entries still reconcile against
+  // what the business was actually quoted.
+  const rate =
+    rateMinor ??
+    tenant?.overageRateMinor ??
+    DEFAULT_RATE_CARD.overageRateMinor;
 
   await db.insert(usageLedger).values({
     tenantId: task.tenantId,
@@ -260,16 +270,42 @@ export async function recordUsage(task: Task, pricePerUnit?: number): Promise<vo
 
 export interface UsageSummary {
   period: string;
+  /** Billable units consumed this period. */
   units: number;
-  amountMinor: number;
   includedUnits: number;
+  /** Units beyond the bundled allowance. */
+  overageUnits: number;
+  /** What the subscription costs. */
+  planMinor: number;
+  /** What the overage costs. */
   overageMinor: number;
+  /** What we actually invoice: subscription + overage. */
+  totalDueMinor: number;
+  /**
+   * Ledger value of the work delivered. Deliberately NOT what we bill --
+   * this is the "here is what your subscription got you" number.
+   */
+  valueDeliveredMinor: number;
+  currency: string;
+  utilisationPct: number;
 }
 
+/**
+ * The period invoice.
+ *
+ * The distinction that matters: `valueDeliveredMinor` is what the agent did,
+ * `totalDueMinor` is what the business owes. Conflating them is how you end
+ * up charging a shop owner ₦7,500 for one report.
+ */
 export async function summariseUsage(tenantId: string, period = billingPeriod()) {
   const db = await getDb();
   const [tenant] = await db
-    .select({ includedUnits: tenants.includedUnits })
+    .select({
+      planMonthlyMinor: tenants.planMonthlyMinor,
+      includedUnits: tenants.includedUnits,
+      overageRateMinor: tenants.overageRateMinor,
+      currency: tenants.currency,
+    })
     .from(tenants)
     .where(eq(tenants.id, tenantId))
     .limit(1);
@@ -277,28 +313,35 @@ export async function summariseUsage(tenantId: string, period = billingPeriod())
   const [row] = await db
     .select({
       units: sql<number>`coalesce(sum(${usageLedger.units}), 0)::int`,
-      amountMinor: sql<number>`coalesce(sum(${usageLedger.amountMinor}), 0)::int`,
+      valueMinor: sql<number>`coalesce(sum(${usageLedger.amountMinor}), 0)::int`,
     })
     .from(usageLedger)
     .where(
-      and(
-        eq(usageLedger.tenantId, tenantId),
-        eq(usageLedger.period, period),
-      ),
+      and(eq(usageLedger.tenantId, tenantId), eq(usageLedger.period, period)),
     );
 
-  const includedUnits = tenant?.includedUnits ?? 0;
+  const includedUnits = tenant?.includedUnits ?? DEFAULT_RATE_CARD.includedUnits;
+  const overageRateMinor =
+    tenant?.overageRateMinor ?? DEFAULT_RATE_CARD.overageRateMinor;
   const units = row?.units ?? 0;
-  const amountMinor = row?.amountMinor ?? 0;
-  const billableOverage = Math.max(0, units - includedUnits);
+
+  const overageUnits = Math.max(0, units - includedUnits);
+  const planMinor = tenant?.planMonthlyMinor ?? 0;
+  const overageMinor = overageUnits * overageRateMinor;
 
   return {
     period,
     units,
-    amountMinor,
     includedUnits,
-    overageMinor: Math.round(
-      billableOverage * (amountMinor / Math.max(units, 1)),
+    overageUnits,
+    planMinor,
+    overageMinor,
+    totalDueMinor: planMinor + overageMinor,
+    valueDeliveredMinor: row?.valueMinor ?? 0,
+    currency: tenant?.currency ?? "NGN",
+    utilisationPct: Math.min(
+      100,
+      Math.round((units / Math.max(includedUnits, 1)) * 100),
     ),
   } satisfies UsageSummary;
 }

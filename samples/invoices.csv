@@ -1,0 +1,5 @@
+number,customer_name,wa_id,amount,issued_on,due_on
+INV-2001,Chioma Eze,+234 802 000 0002,96000,2026-09-29,2026-10-10
+INV-2002,Adeyemi Hassan,+234 803 000 0003,43500,2026-10-01,15/10/2026
+INV-2003,Blessing Obi,+234 804 000 0004,21500,2026-10-02,20/10/2026
+INV-2004,Walk-in Customer,,15000,2026-10-05,2026-11-05

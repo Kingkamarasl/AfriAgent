@@ -86,10 +86,56 @@ export const BILLABLE_UNITS: Record<TaskKind, number> = {
 };
 
 /**
- * Default price per billable unit, in minor units.
- * Placeholder rate card -- replace with a real per-tenant price before launch.
+ * Default rate card.
+ *
+ * The pricing model is a subscription that *bundles* billable units, plus a
+ * metered overage beyond that. The important invariant:
+ *
+ *     planMonthlyMinor / includedUnits  ===  overageRateMinor
+ *
+ * If those two disagree the business either never pays for overuse or pays a
+ * rate unrelated to what they were quoted, and both destroy trust.
+ * `assertRateCardCoherent` enforces it.
+ *
+ * These numbers are a starting point for a Nigerian SME, not a researched
+ * price. Tune against real LLM and WhatsApp costs before selling.
  */
-export const DEFAULT_PRICE_PER_UNIT_MINOR = 50;
+export const DEFAULT_RATE_CARD = {
+  /** ₦15,000 / month. */
+  planMonthlyMinor: 1_500_000,
+  /** Units bundled in the subscription. */
+  includedUnits: 200,
+  /** ₦75 / unit beyond the allowance -- equals the bundled unit price. */
+  overageRateMinor: 7_500,
+} as const;
+
+export interface RateCard {
+  planMonthlyMinor: number;
+  includedUnits: number;
+  overageRateMinor: number;
+}
+
+export class IncoherentRateCardError extends Error {
+  constructor(readonly rate: RateCard) {
+    super(
+      `Rate card is incoherent: a ${rate.planMonthlyMinor / 100} plan over ` +
+        `${rate.includedUnits} units implies ` +
+        `${rate.planMonthlyMinor / Math.max(rate.includedUnits, 1) / 100} per unit, ` +
+        `but overage is charged at ${rate.overageRateMinor / 100}.`,
+    );
+    this.name = "IncoherentRateCardError";
+  }
+}
+
+/** Throws if the bundled unit price and the overage rate disagree. */
+export function assertRateCardCoherent(rate: RateCard): void {
+  if (rate.includedUnits <= 0) throw new IncoherentRateCardError(rate);
+  const implied = rate.planMonthlyMinor / rate.includedUnits;
+  // A small band is allowed: rounding to the nearest naira is normal.
+  if (Math.abs(implied - rate.overageRateMinor) > 50) {
+    throw new IncoherentRateCardError(rate);
+  }
+}
 
 /**
  * Kinds that always require human approval before anything is sent.

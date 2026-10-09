@@ -103,6 +103,12 @@ export const tenants = pgTable(
     planMonthlyMinor: integer("plan_monthly_minor"),
     /** Included billable units per month; overage is billed per unit. */
     includedUnits: integer("included_units").notNull().default(200),
+    /**
+     * Price per unit beyond `includedUnits`. Stored per tenant so a price
+     * change is a data edit, not a deploy. Kept coherent with
+     * planMonthlyMinor / includedUnits by `assertRateCardCoherent`.
+     */
+    overageRateMinor: integer("overage_rate_minor").notNull().default(7500),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex("tenants_slug_idx").on(t.slug)],

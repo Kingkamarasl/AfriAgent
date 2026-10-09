@@ -19,9 +19,13 @@ const nextConfig: NextConfig = {
     },
   },
 
-  // PGlite is a WASM build of Postgres and must not be bundled; postgres.js
-  // expects a real Node socket. Both stay external to the server build.
-  serverExternalPackages: ["@electric-sql/pglite", "postgres"],
+  // NOTE: `serverExternalPackages` is deliberately NOT used for
+  // @electric-sql/pglite or postgres. On Windows, Turbopack implements
+  // "external" in dev by creating a junction inside .next/dev/node_modules,
+  // which requires symlink privileges the OS does not grant by default --
+  // the dev server then dies with "Access is denied (os error 5)".
+  // `src/db/client.ts` loads both via a computed dynamic import instead,
+  // which the bundler leaves alone and Node resolves at runtime.
 };
 
 export default nextConfig;

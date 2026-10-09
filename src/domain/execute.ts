@@ -22,16 +22,26 @@ import type { Task } from "@/db/schema";
  * change to the surrounding engine.
  */
 
+/** How a finished task reaches someone. Persisted with the task. */
+export interface TaskDelivery {
+  /** One message per recipient, e.g. six chased invoices. */
+  recipients?: Array<{ waId: string; template: TemplateSend; preview: string }>;
+  /** A single message to the conversation's contact. */
+  template?: TemplateSend;
+}
+
 export interface TaskResult {
   /** One-line description for the dashboard and audit log. */
   summary: string;
   data: Record<string, unknown>;
+  /**
+   * Delivery plan, if this task sends anything. Nested rather than top-level
+   * because `data` is what gets persisted -- a top-level `recipients` field
+   * would be silently dropped and the task would fall back to free-form text.
+   */
+  delivery?: TaskDelivery;
   /** Human-readable preview of what will be sent, if anything. */
   draftBody?: string;
-  /** Template to deliver, when the message leaves the 24h window. */
-  template?: TemplateSend;
-  /** Per-recipient sends for batch tasks (e.g. 6 overdue invoices). */
-  recipients?: Array<{ waId: string; template: TemplateSend; preview: string }>;
   /** Report tasks are informational; they do not send anything. */
   isInformational?: boolean;
 }
@@ -228,7 +238,10 @@ export async function runInvoiceReminder(
         .join("\n") +
       `\n\nTotal: ${formatMoney(totalOutstandingMinor, tenant.currency)}` +
       (daysOverdue > 0 ? `\nOldest is ${daysOverdue} days overdue.` : ""),
-    recipients,
+    // Nested under `delivery` so it survives persistence. If this were a
+    // top-level field, these templates would be dropped and the task would
+    // send one free-form message to the owner instead of chasing anyone.
+    delivery: { recipients },
     data: {
       overdueCount: overdue.length,
       totalOutstandingMinor,
@@ -313,7 +326,9 @@ export async function runDailySummary(tenantId: string): Promise<TaskResult> {
   return {
     summary: `Daily summary: ${sales.summary}`,
     draftBody: `*Daily summary* — ${new Date().toISOString().slice(0, 10)}\n\n${body}`,
-    template: { template: "daily_summary", values: ["AfriAgent", body] },
+    // A scheduled summary is initiating, not replying, so it always leaves
+    // outside the 24h window and must be an approved template.
+    delivery: { template: { template: "daily_summary", values: ["AfriAgent", body] } },
     data: { sales: sales.data, lowStock: low.data, invoices: chasing.data },
   };
 }

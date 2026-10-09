@@ -1,6 +1,7 @@
 import { getDb } from "@/db/client";
 import { tenants } from "@/db/schema";
 import { Playground } from "@/components/Playground";
+import { ImportPanel } from "@/components/ImportPanel";
 import { ApprovalCard } from "@/components/ApprovalCard";
 import { RetryButton } from "@/components/RetryButton";
 import {
@@ -49,11 +50,8 @@ export default async function DashboardPage() {
     summariseUsage(tenant.id),
   ]);
 
-  const usagePct = Math.min(
-    100,
-    Math.round((usage.units / Math.max(usage.includedUnits, 1)) * 100),
-  );
-  const overage = usage.units > usage.includedUnits;
+  const overage = usage.overageUnits > 0;
+  const remaining = Math.max(0, usage.includedUnits - usage.units);
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
@@ -72,25 +70,53 @@ export default async function DashboardPage() {
             </p>
           </div>
 
-          <div className="min-w-56 rounded-xl border border-zinc-200 px-4 py-2.5 dark:border-zinc-800">
+          {/* Billing is framed as subscription + overage, never as a running
+              per-task tally. Showing "you were charged N times" for one
+              message turns good value into nickel-and-diming. */}
+          <div className="min-w-64 rounded-xl border border-zinc-200 px-4 py-2.5 dark:border-zinc-800">
             <div className="flex items-baseline justify-between">
               <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
-                Usage · {usage.period}
+                This month
               </span>
               <span className="text-xs font-semibold">
-                {usage.units} / {usage.includedUnits} units
+                {usage.units} task{usage.units === 1 ? "" : "s"} completed
               </span>
             </div>
+
             <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
               <div
                 className={`h-full rounded-full ${overage ? "bg-red-500" : "bg-emerald-500"}`}
-                style={{ width: `${usagePct}%` }}
+                style={{ width: `${usage.utilisationPct}%` }}
               />
             </div>
+
+            <dl className="mt-2 space-y-0.5 text-[11px]">
+              <div className="flex justify-between">
+                <dt className="text-zinc-500 dark:text-zinc-400">Subscription</dt>
+                <dd className="font-medium">
+                  {formatMoney(usage.planMinor, tenant.currency)}
+                </dd>
+              </div>
+              <div className="flex justify-between">
+                <dt className="text-zinc-500 dark:text-zinc-400">
+                  Overage ({usage.overageUnits} beyond {usage.includedUnits})
+                </dt>
+                <dd className="font-medium">
+                  {formatMoney(usage.overageMinor, tenant.currency)}
+                </dd>
+              </div>
+              <div className="flex justify-between border-t border-zinc-200 pt-0.5 dark:border-zinc-800">
+                <dt className="font-medium">Due</dt>
+                <dd className="font-semibold">
+                  {formatMoney(usage.totalDueMinor, tenant.currency)}
+                </dd>
+              </div>
+            </dl>
+
             <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
               {overage
-                ? `${formatMoney(usage.overageMinor, tenant.currency)} over plan`
-                : `${usage.includedUnits - usage.units} units remaining`}
+                ? `${usage.overageUnits} tasks beyond the included allowance`
+                : `${remaining} included tasks remaining`}
             </p>
           </div>
         </div>
@@ -99,14 +125,15 @@ export default async function DashboardPage() {
       <main className="mx-auto grid max-w-7xl gap-6 px-6 py-6 lg:grid-cols-[380px_1fr]">
         <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
           <Playground />
+          <ImportPanel />
 
           <section className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
             <h2 className="mb-2 font-semibold">How billing works</h2>
             <p className="text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
-              You are charged when work is <strong>delivered</strong>, not when
-              it is requested. One WhatsApp message that asks for three things
-              creates three tasks — and you see every one of them before it
-              reaches a customer.
+              Your plan includes{" "}
+              <strong>{usage.includedUnits} tasks a month</strong>. One
+              WhatsApp message asking for three things counts as three tasks —
+              and you see every one of them before it reaches a customer.
             </p>
           </section>
         </div>
@@ -128,7 +155,7 @@ export default async function DashboardPage() {
             ) : (
               <div className="space-y-3">
                 {pending.map((task) => (
-                  <ApprovalCard key={task.id} task={task} currency={tenant.currency} />
+                  <ApprovalCard key={task.id} task={task} />
                 ))}
               </div>
             )}

@@ -1,5 +1,7 @@
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
+import { migrate as migratePglite } from "drizzle-orm/pglite/migrator";
 import { drizzle as drizzlePostgres } from "drizzle-orm/postgres-js";
+import { migrate as migratePostgres } from "drizzle-orm/postgres-js/migrator";
 import * as schema from "./schema";
 
 /**
@@ -9,33 +11,70 @@ import * as schema from "./schema";
  *   DATABASE_URL unset -> PGlite, a real Postgres compiled to WASM that runs
  *   in-process and persists to `.data/`. Dev stays zero-setup while the
  *   dialect, the SQL and the migrations stay identical to production.
+ *
+ * Migrations are applied once on connect. PGlite is single-writer, so seeding
+ * the same directory while `next dev` holds it open leaves the dev server on a
+ * stale schema. Auto-migrating on boot keeps the running app in step with
+ * `src/db/schema.ts`, which is the thing that actually matters in dev.
  */
 
 export const isLocalPglite = !process.env.DATABASE_URL;
 
-type Database = ReturnType<typeof buildPglite> | ReturnType<typeof buildPostgres>;
-
-function buildPglite() {
-  // Required lazily: importing WASM at module scope breaks the build graph.
-  const { PGlite } = require("@electric-sql/pglite") as typeof import("@electric-sql/pglite");
-  const { mkdirSync } = require("node:fs") as typeof import("node:fs");
+/**
+ * The driver packages are loaded through a *computed* specifier on purpose.
+ *
+ * Listing them in `serverExternalPackages` is the documented approach, but
+ * Turbopack implements "external" on Windows by creating a symlink under
+ * `.next/dev/node_modules`, and this OS refuses symlinks without
+ * Administrator or Developer Mode ("Access is denied (os error 5)"), taking
+ * the dev server down with a Turbopack panic. A specifier the bundler cannot
+ * statically resolve is left alone and resolved by Node at runtime.
+ */
+async function buildPglite() {
+  const specifier = "@electric-sql/pglite";
+  const { mkdirSync } = await import("node:fs") as typeof import("node:fs");
 
   const dataDir = process.env.PGLITE_PATH ?? ".data/pglite";
   // PGlite's own mkdir is non-recursive, so a missing parent (`.data`) throws
   // ENOENT rather than creating the chain.
   mkdirSync(dataDir, { recursive: true });
 
-  const client = new PGlite(dataDir);
-  return drizzlePglite(client, { schema });
+  const { PGlite } = await import(specifier);
+  return drizzlePglite(new PGlite(dataDir), { schema });
 }
 
-function buildPostgres() {
-  const postgres = require("postgres") as typeof import("postgres");
-  const client = postgres(process.env.DATABASE_URL!, {
+async function buildPostgres() {
+  const specifier = "postgres";
+  type PostgresFactory = (
+    connectionString: string,
+    options?: Record<string, unknown>,
+  ) => ReturnType<typeof import("postgres")>;
+
+  // postgres.js is CommonJS, so the callable lands on `.default`.
+  const mod = (await import(specifier)) as unknown as { default: PostgresFactory };
+  const client = mod.default(process.env.DATABASE_URL!, {
     max: 10,
     prepare: false, // Required by poolers (PgBouncer, Neon, Supabase).
   });
   return drizzlePostgres(client, { schema });
+}
+
+export type Database = Awaited<ReturnType<typeof buildPglite>> | Awaited<ReturnType<typeof buildPostgres>>;
+
+async function connect(): Promise<Database> {
+  const db = await (isLocalPglite ? buildPglite() : buildPostgres());
+
+  if (process.env.SKIP_AUTO_MIGRATE === "1") return db;
+
+  const runner = (
+    isLocalPglite ? migratePglite : migratePostgres
+  ) as unknown as (d: unknown, opts: { migrationsFolder: string }) => Promise<unknown>;
+
+  // Drizzle's migrator takes its own migration lock, so several instances
+  // booting at once is fine.
+  await runner(db, { migrationsFolder: "./drizzle" });
+
+  return db;
 }
 
 /**
@@ -47,10 +86,6 @@ const globalForDb = globalThis as unknown as {
   __afriagentDb?: Database;
   __afriagentDbPromise?: Promise<Database>;
 };
-
-async function connect(): Promise<Database> {
-  return isLocalPglite ? buildPglite() : buildPostgres();
-}
 
 export const dbPromise: Promise<Database> =
   globalForDb.__afriagentDbPromise ??

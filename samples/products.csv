@@ -1,0 +1,6 @@
+sku,name,unit,stock,reorder_level,unit_price
+RICE-50,"Rice 50kg bag, premium grade",bag,4,8,48000
+OIL-25L,Palm oil 25L,jerrycan,11,10,21500
+SUG-1KG,Granulated sugar 1kg,bag,26,15,"1,450"
+TEA-400,Tea bags 100s,box,9,6,3800
+MILK-1L,Peak milk powder 400g,tin,3,12,4200

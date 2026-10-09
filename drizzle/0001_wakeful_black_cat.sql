@@ -1,0 +1,1 @@
+ALTER TABLE "tenants" ADD COLUMN "overage_rate_minor" integer DEFAULT 7500 NOT NULL;

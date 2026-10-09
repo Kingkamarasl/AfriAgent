@@ -19,24 +19,22 @@ import { formatMoney } from "@/lib/money";
  */
 
 interface StoredResult {
-  recipients?: Array<{ waId: string; preview: string }>;
+  delivery?: {
+    recipients?: Array<{ waId: string; preview: string }>;
+  };
   overdueCount?: number;
+  lowStockCount?: number;
 }
 
-export function ApprovalCard({
-  task,
-  currency,
-}: {
-  task: Task;
-  currency: string;
-}) {
+export function ApprovalCard({ task }: { task: Task }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(task.draftBody ?? "");
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
 
   const result = (task.result ?? {}) as StoredResult;
-  const recipientCount = result.recipients?.length ?? 0;
+  const recipients = result.delivery?.recipients ?? [];
+  const recipientCount = recipients.length;
 
   function run(fn: () => Promise<{ ok: boolean; error?: string }>) {
     setError(null);
@@ -59,7 +57,7 @@ export function ApprovalCard({
             </p>
           )}
         </div>
-        <Meta task={task} currency={currency} />
+        <Meta task={task} />
       </header>
 
       {recipientCount > 0 && (
@@ -106,13 +104,13 @@ export function ApprovalCard({
         )}
       </div>
 
-      {result.recipients && result.recipients.length > 0 && (
+      {recipients.length > 0 && (
         <details className="mt-3">
           <summary className="cursor-pointer text-sm font-medium text-zinc-600 dark:text-zinc-400">
-            Preview all {result.recipients.length} messages
+            Preview all {recipients.length} messages
           </summary>
           <div className="mt-2 space-y-2">
-            {result.recipients.map((r, i) => (
+            {recipients.map((r, i) => (
               <div
                 key={`${r.waId}-${i}`}
                 className="rounded-lg border border-zinc-200 bg-white p-2.5 dark:border-zinc-800 dark:bg-zinc-900"
@@ -166,12 +164,33 @@ export function ApprovalCard({
   );
 }
 
-function Meta({ task, currency }: { task: Task; currency: string }) {
-  const price = task.billableUnits * 50; // matches DEFAULT_PRICE_PER_UNIT_MINOR
+/**
+ * Shows what this task will *achieve*, never what it costs.
+ *
+ * A per-task price here reads as nickel-and-diming: one WhatsApp message
+ * produced three cards, each with its own price, for work the owner asked for
+ * in a single sentence. Reach is the number that sells it.
+ */
+function Meta({ task }: { task: Task }) {
+  const result = (task.result ?? {}) as StoredResult;
+  const reach = result.delivery?.recipients?.length ?? 0;
+  const overdue = typeof result.overdueCount === "number" ? result.overdueCount : 0;
+  const lowCount =
+    typeof result.lowStockCount === "number" ? result.lowStockCount : 0;
+
+  const facts: string[] = [];
+  if (reach > 0) {
+    facts.push(`${reach} customer${reach === 1 ? "" : "s"} will be contacted`);
+  }
+  if (overdue > 0) facts.push(`${overdue} invoice${overdue === 1 ? "" : "s"} overdue`);
+  if (lowCount > 0) facts.push(`${lowCount} product${lowCount === 1 ? "" : "s"} low`);
+
   return (
     <div className="text-right text-xs text-zinc-500 dark:text-zinc-400">
-      <p>{task.billableUnits} billable unit{task.billableUnits === 1 ? "" : "s"}</p>
-      <p>{formatMoney(price, currency)}</p>
+      {facts.map((f) => (
+        <p key={f}>{f}</p>
+      ))}
+      <p className="mt-0.5 text-zinc-400 dark:text-zinc-500">Included in your plan</p>
     </div>
   );
 }

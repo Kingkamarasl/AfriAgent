@@ -65,11 +65,18 @@ npm run smoke      # 20 assertions
 | Concern | In development | In production |
 | --- | --- | --- |
 | Database | PGlite — real Postgres compiled to WASM, in-process, on disk at `.data/` | Postgres via `DATABASE_URL` (Neon, Supabase, self-hosted) |
+| Migrations | Applied automatically on connect | Same, or `SKIP_AUTO_MIGRATE=1` |
 | WhatsApp | Simulator — logs the exact payload it would have sent | Meta WhatsApp Cloud API |
 | Auth | Seeded owner | Your session provider |
 
 Both databases share one migration history, so the SQL you test against locally
 is the SQL that runs in production. Setting `DATABASE_URL` is the only switch.
+
+> **Windows note.** PGlite and `postgres` are loaded via a computed dynamic
+> import rather than `serverExternalPackages`. Turbopack implements "external"
+> on Windows by creating a symlink under `.next/dev/node_modules`, which this
+> OS refuses without Administrator or Developer Mode, and the dev server dies
+> with a Turbopack panic. See the comment in `src/db/client.ts`.
 
 ## Scripts
 
@@ -79,9 +86,77 @@ is the SQL that runs in production. Setting `DATABASE_URL` is the only switch.
 | `npm run build` | Production build |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run smoke` | Asserts the product guarantees (see below) |
-| `npm run db:seed` | Migrate + seed the demo shop (idempotent) |
+| `npm run db:seed` | Seed the demo shop (idempotent) |
 | `npm run db:generate` | Generate migrations from the schema |
 | `npm run db:studio` | Browse the database |
+
+Migrations apply automatically on first connection, so `npm run dev` is always
+in step with `src/db/schema.ts`. Set `SKIP_AUTO_MIGRATE=1` to manage them
+yourself.
+
+## Getting data in
+
+The agent is only as good as what it can read, and shops have no API. CSV
+import is the onboarding path, and it is deliberately two-step:
+
+```
+POST /api/import?kind=products            -> validate only, writes nothing
+POST /api/import?kind=products&commit=1   -> write
+```
+
+Or use the panel on the dashboard. Sample files are in `samples/`.
+
+Products accept `sku, name, unit, stock, reorder_level, unit_price`. Invoices
+accept `number, customer_name, wa_id, amount, issued_on, due_on`.
+
+Behaviour worth knowing:
+
+- **Column aliases.** `price` / `cost` / `selling_price` all work. So do
+  `phone`, `mobile`, `whatsapp`. Exports from different tools mostly just work.
+- **Dates are day-first.** `31/12/2026` is 31 December, not 31 March. Reading
+  it US-style silently produces due dates that are eight months wrong.
+- **Phone numbers are normalised.** `+234 802 000 0002` matches a stored
+  `2348020000002`, so you can re-import a corrected file without duplicating.
+- **Re-importing is an upsert.** Matched on SKU / invoice number.
+- **Structural errors block the whole import.** Nothing lands. Warnings (a
+  missing price, an invoice with no WhatsApp number) do not block — those are
+  the owner's judgement call. An invoice with no `wa_id` is still recorded, and
+  the warning says it cannot be chased.
+
+## Billing model
+
+A subscription that bundles an allowance, plus metered overage:
+
+```
+plan (₦15,000)  ÷  included (200 tasks)  ==  overage rate (₦75/task)
+```
+
+That identity is asserted in code. It shipped broken once — a ₦15,000 plan
+with a ₦0.50 overage rate meant heavy users never paid extra — so
+`assertRateCardCoherent` now throws if the two halves drift apart, and the
+smoke test covers it.
+
+Two numbers that are deliberately kept apart:
+
+- `valueDeliveredMinor` — what the agent did
+- `totalDueMinor` — what the business owes
+
+The dashboard shows **subscription / overage / due**, never a per-task price.
+A shop owner who gets three approval cards from one WhatsApp message, each
+priced separately, experiences it as nickel-and-diming rather than as three
+pieces of work done.
+
+## Scheduled work
+
+```
+GET /api/cron/daily-summary      Authorization: Bearer $CRON_SECRET
+```
+
+Runs the daily summary for every tenant that hasn't had one today (in *their*
+timezone), and is safe to retry. The summary auto-sends: the recipient is the
+shop's own owner, so there is no risk of committing the business to a customer,
+and requiring a click every morning is exactly the approval fatigue that gets
+the agent switched off. Anything customer-facing stays gated.
 
 ## What the smoke test proves
 
@@ -89,13 +164,18 @@ is the SQL that runs in production. Setting `DATABASE_URL` is the only switch.
 exercising code paths:
 
 - one inbound message fans out into three separate billable tasks
+- terse phrasing still fans out; `"bread and milk"` stays one task
 - the sender is resolved as **owner vs customer** — the same words mean
   different things depending on who sent them
 - `pending_approval -> sent` is **refused** (the gate cannot be skipped)
 - approval alone does **not** bill; delivery does
-- the usage increase exactly matches the task's billable units
+- a batch task sends a **template per recipient** — and persists the plan
 - `sent` is **terminal**, so a delivered task cannot be re-opened and re-sent
 - metering the same task repeatedly bills once
+- the rate card is coherent, and an incoherent one is rejected
+- the CSV parser survives BOM, CRLF and quoted commas; dates are day-first
+- an import with structural errors writes nothing
+- the daily summary runs once, not twice
 - every transition lands in the audit log
 
 ## Connecting real WhatsApp
@@ -145,18 +225,23 @@ src/
     migrate.ts       one migration history for both drivers
     seed.ts          demo shop with a week of trading
   domain/
-    tasks.ts         THE STATE MACHINE + metering policy
+    tasks.ts         THE STATE MACHINE + rate card
     task-service.ts  only place a task can change status
     pipeline.ts      inbound -> plan -> execute -> gate -> deliver
     intents.ts       message -> tasks (owner vs customer routing)
     execute.ts       sales / invoices / low stock / daily summary
+    scheduler.ts     daily summary cron
+    import.ts        CSV import with validation
   lib/
     whatsapp/        Cloud API client, templates, webhook parsing, HMAC verify
+    csv.ts           RFC 4180 parser + column aliases
     money.ts         integer minor units only, never floats
     time.ts          tenant-timezone day boundaries
   app/
     api/webhooks/whatsapp    Meta webhook (verify + events)
     api/simulate/inbound     local simulator
+    api/import               CSV import (dry run by default)
+    api/cron/daily-summary   scheduled summaries
     page.tsx                 dashboard
 ```
 
@@ -181,12 +266,14 @@ same task forward and double-send a message to a customer.
 
 **Real:** task engine and metering, approval gate, audit log, timezone-correct
 reporting, WhatsApp Cloud API integration, webhook signature verification,
-idempotent delivery, tenant scoping, PGlite/Postgres parity.
+idempotent delivery, tenant scoping, PGlite/Postgres parity, CSV import with
+validation, scheduled daily summary.
 
 **Stubbed / not built yet:**
 
 - **Auth.** `requireActor()` returns the seeded owner. Replace with a real
-  session and verify role *and* tenant on every call — before shipping.
+  session and verify role *and* tenant on every call — before shipping. This
+  is still the biggest risk in the codebase.
 - **Intent routing is regex, not an LLM.** Deliberately: every branch is
   testable and behaviour is identical with or without an API key. To swap in a
   model, replace the body of `routeMessage` with a tool-call loop returning the
@@ -195,24 +282,24 @@ idempotent delivery, tenant scoping, PGlite/Postgres parity.
   kinds and states but no executor yet.
 - **No durable queue.** Tasks execute inline in the webhook. Real deployments
   need Inngest or Trigger.dev so a slow report never delays Meta's ack.
-- **Rate card is a placeholder** (`DEFAULT_PRICE_PER_UNIT_MINOR`). Tune against
-  real LLM + WhatsApp costs before quoting anyone.
+- **Order import.** Products and invoices only; the CSV importer does not yet
+  read historical sales, which is what `sales_report` reads from.
+- **Rate card is a starting point.** Tune against real LLM + WhatsApp costs
+  before quoting anyone.
 - **No payments collection.** v1 chases invoices and sends a payment link; it
   does not take money. Mobile-money integration is deliberately out of scope.
 
 ## Suggested next steps
 
-1. **Real auth** — the only thing standing between this and anyone approving
-   another business's messages.
-2. **Durable queue** — move `processTask` into Inngest; the webhook must
-   acknowledge in milliseconds.
-3. **Knowledge base** — document ingestion + retrieval for `customer_question`.
-   This is what makes the support flow genuinely useful rather than a lookup.
-4. **Scheduled tasks** — `listScheduledReady` exists; wire it to a cron for the
-   daily summary. This is the retention hook.
-5. **Data import** — CSV/Excel upload. This is the real bottleneck for shops
-   with no POS integration, and it gates how much the agent can honestly claim
-   to know.
+1. **Real auth + tenancy guards** — from last time; still the biggest risk.
+2. **Decide the WhatsApp number question** — per-shop numbers or one shared
+   number? It changes the schema, the onboarding flow and the compliance story.
+3. **Order/sales import** — completes the data picture so the sales report
+   works on day one rather than day thirty.
+4. **Graduated autonomy** — auto-send low-risk categories, escalate on novelty
+   or value thresholds, let the shop tune it.
+5. **Durable queue** — move `processTask` into Inngest.
+6. **Knowledge base** — document ingestion + retrieval for `customer_question`.
 
 ## Compliance notes
 

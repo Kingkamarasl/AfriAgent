@@ -114,22 +114,16 @@ const OWNER_RULES: Rule[] = [
  * "Show me today's sales, remind overdue invoices and tell me what's running
  *  low" is three Tasks, not one -- and it is billed as three.
  *
- * Splits on comma / "and also" / " and " / bullet markers, but not on "and"
- * when it is clearly internal to a clause ("bread and milk").
+ * Splits on commas, semicolons, newlines, and the explicit connectives
+ * ("and also", "and then"). A bare " and " is deliberately NOT a separator,
+ * because it is usually internal to a clause ("bread and milk"). The `, and`
+ * form is handled by the comma branch, so natural phrasings still split.
  */
 export function splitIntents(text: string): string[] {
   return text
     .split(/\s*(?:,\s*(?:and\s+)?|\band also\b|\band then\b|;|\n+|\s•\s)\s*/i)
     .map((s) => s.trim())
-    .filter((s) => s.length > 2)
-    .filter((s, _i, all) => !_isFragmentOfPrevious(s, all));
-}
-
-function _isFragmentOfPrevious(fragment: string, all: string[]): boolean {
-  const idx = all.indexOf(fragment);
-  if (idx <= 0) return false;
-  // Keep short tails like "and low stock" attached to the clause before them.
-  return fragment.split(/\s+/).length <= 4 && idx === all.length - 1;
+    .filter((s) => s.length > 2);
 }
 
 export function routeMessage(text: string): PlannedTask[] {

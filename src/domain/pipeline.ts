@@ -197,7 +197,14 @@ export async function processTask(taskId: string): Promise<void> {
       actor: "system",
       note: result.summary,
       patch: {
-        result: result.data as Record<string, unknown>,
+        // The delivery plan is persisted alongside the data, not beside it.
+        // Anything an executor returns outside `data` is invisible to
+        // `sendTask` later, which silently degrades a batch task into a
+        // single free-form message.
+        result: {
+          ...result.data,
+          delivery: result.delivery ?? null,
+        },
         draftBody: result.draftBody,
       },
     });
@@ -222,10 +229,12 @@ export async function processTask(taskId: string): Promise<void> {
 /* Delivery                                                             */
 /* ------------------------------------------------------------------ */
 
-/** Persisted `result` shape. Parsed defensively -- it is JSON in the DB. */
+/** Persisted `task.result` shape. Parsed defensively -- it is JSON in the DB. */
 interface StoredResult {
-  recipients?: Array<{ waId: string; template: TemplateSend; preview: string }>;
-  template?: TemplateSend;
+  delivery?: {
+    recipients?: Array<{ waId: string; template: TemplateSend; preview: string }>;
+    template?: TemplateSend;
+  };
 }
 
 export interface SendTaskOptions {
@@ -260,7 +269,7 @@ export async function sendTask(taskId: string, opts: SendTaskOptions = {}) {
   }
 
   const insideWindow = isInsideServiceWindow(conversation?.windowExpiresAt ?? null);
-  const result = (task.result ?? {}) as StoredResult;
+  const { delivery } = (task.result ?? {}) as StoredResult;
 
   await transitionTask(taskId, "sending", {
     actor: opts.actor ?? "system",
@@ -270,9 +279,9 @@ export async function sendTask(taskId: string, opts: SendTaskOptions = {}) {
   let lastResult: SendResult | null = null;
 
   try {
-    if (result.recipients?.length) {
+    if (delivery?.recipients?.length) {
       // Batch task: one approved template per customer, e.g. 6 chased invoices.
-      for (const recipient of result.recipients) {
+      for (const recipient of delivery.recipients) {
         const outbound: OutboundMessage = { to: recipient.waId, template: recipient.template };
         lastResult = await sendMessage(outbound, {
           insideServiceWindow: true, // Templates need no window.
@@ -280,13 +289,13 @@ export async function sendTask(taskId: string, opts: SendTaskOptions = {}) {
         });
         await recordOutbound(task, outbound, lastResult, recipient.template.template);
       }
-    } else if (result.template) {
-      const outbound: OutboundMessage = { to, template: result.template };
+    } else if (delivery?.template) {
+      const outbound: OutboundMessage = { to, template: delivery.template };
       lastResult = await sendMessage(outbound, {
         insideServiceWindow: true,
         dryRun: opts.dryRun,
       });
-      await recordOutbound(task, outbound, lastResult, result.template.template);
+      await recordOutbound(task, outbound, lastResult, delivery.template.template);
     } else {
       // Free-form text. Throws if the 24h window has closed -- by design.
       const outbound: OutboundMessage = { to, text: task.draftBody ?? "" };
