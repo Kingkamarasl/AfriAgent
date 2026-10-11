@@ -168,6 +168,39 @@ still metered per completed task. This exists so the billable weights can be
 set from measured numbers during the pilot rather than guessed. A per-tenant
 daily budget stops the spending before it happens.
 
+## Knowledge base
+
+`/knowledge` is where a business tells its assistant what is true. Without it
+the assistant has nothing to stand behind and escalates everything, so this is
+the page that makes the AI layer worth anything.
+
+- Facts are **authored as drafts**. Publishing is deliberate, because an
+  `active` fact is something the assistant may state as truth.
+- Every fact is tagged `authoritative` (quotable, must be cited) or
+  `informational` (context only, never quotable). The UI spells out the
+  consequence at the point of choice, because mislabelling prose as
+  authoritative is how a shop promises a policy it never made.
+- Owners and managers only; a shop's prices are not a staffer's to change.
+- Archiving is preferred over deleting — the history matters when a customer
+  was told something last month.
+
+The tenant scoping lives in `src/domain/knowledge.ts`, not inside the server
+action, so it can be tested: a rule that only exists inside an action is a rule
+nobody can prove.
+
+## Handoffs
+
+`/handoffs` is where escalations land.
+
+The assistant hands over constantly and by design. Before this existed it could
+give up politely — and tell the customer someone would follow up — with nothing
+queued, which is the fastest way to lose a shop's trust. Every path that
+decides "I will not answer this" now goes through `escalateToHuman`, which
+records who is waiting, what they asked, and why the assistant stopped.
+
+Claiming is atomic: two staff clicking at once produce one winner and one clear
+error, not two people chasing the same customer.
+
 ## Scripts
 
 | Command | Purpose |
@@ -273,6 +306,10 @@ exercising code paths:
   into its arguments
 - an unpublished (draft) fact is invisible to the model
 - a provider outage or an exhausted budget escalates instead of crashing
+- **an escalation actually reaches the human queue**, with who is waiting and
+  what they asked; a retried task does not queue them twice
+- one business cannot edit, publish or delete another business's facts
+- a new fact is invisible to the assistant until it is published
 - every transition lands in the audit log
 
 ## Connecting real WhatsApp

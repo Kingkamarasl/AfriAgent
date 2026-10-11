@@ -144,6 +144,53 @@ export const businessFacts = pgTable(
   ],
 );
 
+export const handoffStatus = pgEnum("handoff_status", [
+  "open",
+  "claimed",
+  "resolved",
+  "expired",
+]);
+
+/**
+ * A conversation the assistant deliberately did not finish.
+ *
+ * The grounding layer escalates constantly and by design -- an assistant that
+ * guesses is worse than one that hands over. This table is where that
+ * handover lands. Without it the agent can give up politely and nobody is ever
+ * told, which is the failure mode that loses a shop's trust fastest.
+ */
+export const handoffs = pgTable(
+  "handoffs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    /** The task that triggered the handover, when there was one. */
+    taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+    conversationId: uuid("conversation_id").references(() => conversations.id, {
+      onDelete: "set null",
+    }),
+    contactId: uuid("contact_id").references(() => contacts.id, {
+      onDelete: "set null",
+    }),
+    /** Why the assistant stopped. Specific enough to triage on. */
+    reason: text("reason").notNull(),
+    /** What was asked, what was tried, what was missing. */
+    context: jsonb("context").$type<Record<string, unknown>>().notNull().default({}),
+    status: handoffStatus("status").notNull().default("open"),
+    assignedTo: uuid("assigned_to").references(() => users.id, { onDelete: "set null" }),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    resolutionNote: text("resolution_note"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("handoffs_tenant_status_idx").on(t.tenantId, t.status),
+    index("handoffs_tenant_created_idx").on(t.tenantId, t.createdAt),
+  ],
+);
+
 /* ------------------------------------------------------------------ */
 /* Platform AI configuration                                            */
 /* ------------------------------------------------------------------ */
@@ -622,7 +669,10 @@ export type User = typeof users.$inferSelect;
 export type WhatsappLink = typeof whatsappLinks.$inferSelect;
 export type FactTopic = (typeof factTopic.enumValues)[number];
 export type FactTier = (typeof factTier.enumValues)[number];
+export type FactStatus = (typeof factStatus.enumValues)[number];
 export type BusinessFact = typeof businessFacts.$inferSelect;
+export type Handoff = typeof handoffs.$inferSelect;
+export type HandoffStatus = (typeof handoffStatus.enumValues)[number];
 export type AiUsageEntry = typeof aiUsage.$inferSelect;
 export type TaskKind = (typeof taskKind.enumValues)[number];
 export type TaskStatus = (typeof taskStatus.enumValues)[number];

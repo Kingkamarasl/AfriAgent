@@ -8,6 +8,7 @@ import { Playground } from "@/components/Playground";
 import { ImportPanel } from "@/components/ImportPanel";
 import { ApprovalCard } from "@/components/ApprovalCard";
 import { RetryButton } from "@/components/RetryButton";
+import { AppNav } from "@/components/AppNav";
 import {
   listApprovalQueue,
   recentActivity,
@@ -130,6 +131,9 @@ export default async function DashboardPage() {
                 : `${remaining} included tasks remaining`}
             </p>
           </div>
+        </div>
+        <div className="mt-4">
+          <AppNav current="/" />
         </div>
       </header>
 

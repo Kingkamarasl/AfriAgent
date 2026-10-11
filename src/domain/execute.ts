@@ -12,6 +12,8 @@ import { formatMoney } from "@/lib/money";
 import { startOfDayInZone } from "@/lib/time";
 import { buildTemplatePreview, type TemplateSend } from "@/lib/whatsapp/templates";
 import { answerCustomerQuestion, escalationMessage } from "@/ai/answer";
+import { openHandoff } from "./handoffs";
+import { TASK_KIND_LABEL } from "./tasks";
 import type { Task } from "@/db/schema";
 
 /**
@@ -368,14 +370,15 @@ async function runCustomerQuestion(tenantId: string, task: Task): Promise<TaskRe
   };
 
   if (outcome.verdict === "escalate") {
-    return {
-      summary: `Escalated to a human: ${outcome.reason}`,
-      data,
-      // Escalations are informational for us but they DO tell the customer
-      // someone is on it, so this is a deliverable message rather than a
-      // silent fail.
-      draftBody: escalationMessage(tenant?.name ?? "the business"),
-    };
+    // Route through the single escalation path so the queue always carries
+    // the customer and what they asked, whoever raised it.
+    return escalateToHuman(task, tenant?.name ?? "the business", outcome.reason, {
+      question,
+      toolsUsed: outcome.toolsUsed,
+      citations: outcome.citations,
+      provider: outcome.provider,
+      grounding: data,
+    });
   }
 
   return {
@@ -386,6 +389,45 @@ async function runCustomerQuestion(tenantId: string, task: Task): Promise<TaskRe
     data,
     draftBody: outcome.draft,
   };
+}
+
+/**
+ * Hands the conversation to a human and queues it.
+ *
+ * Every path that decides "I will not answer this" comes through here, so a
+ * customer is never told someone will follow up unless someone actually can
+ * see it. Kinds that exist precisely to need a human -- `handoff` and
+ * `unknown` -- route through it too rather than falling through to a stub.
+ */
+async function escalateToHuman(
+  task: Task,
+  businessName: string,
+  reason: string,
+  context: Record<string, unknown> = {},
+): Promise<TaskResult> {
+  await openHandoff({
+    tenantId: task.tenantId,
+    taskId: task.id,
+    conversationId: task.conversationId ?? undefined,
+    reason,
+    context: { asked: task.requestText, ...context },
+  });
+
+  return {
+    summary: `Handed to a human: ${reason}`,
+    data: { escalated: true, reason },
+    draftBody: escalationMessage(businessName),
+  };
+}
+
+async function tenantName(tenantId: string): Promise<string> {
+  const db = await getDb();
+  const [row] = await db
+    .select({ name: tenants.name })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+  return row?.name ?? "the business";
 }
 
 export async function executeTask(task: Task): Promise<TaskResult> {
@@ -400,12 +442,25 @@ export async function executeTask(task: Task): Promise<TaskResult> {
       return runDailySummary(task.tenantId);
     case "customer_question":
       return runCustomerQuestion(task.tenantId, task);
+
+    case "handoff":
+    case "unknown":
+    case "appointment_book":
+    case "order_create":
+      // Not automated yet. Rather than fake an answer or sit silent, say so
+      // and put a human on it -- the honest behaviour, and it keeps the
+      // customer informed instead of ignored.
+      return escalateToHuman(
+        task,
+        await tenantName(task.tenantId),
+        task.kind === "handoff"
+          ? "customer asked for a person"
+          : task.kind === "unknown"
+            ? "request could not be understood"
+            : `${TASK_KIND_LABEL[task.kind]} is not automated yet`,
+      );
+
     default:
-      return {
-        summary: `No executor for ${task.kind} yet`,
-        data: {},
-        draftBody: `AfriAgent is not able to handle "${task.title}" yet. A member of the team has been notified.`,
-        isInformational: true,
-      };
+      return escalateToHuman(task, await tenantName(task.tenantId), "no handler");
   }
 }
