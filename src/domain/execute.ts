@@ -11,6 +11,7 @@ import {
 import { formatMoney } from "@/lib/money";
 import { startOfDayInZone } from "@/lib/time";
 import { buildTemplatePreview, type TemplateSend } from "@/lib/whatsapp/templates";
+import { answerCustomerQuestion, escalationMessage } from "@/ai/answer";
 import type { Task } from "@/db/schema";
 
 /**
@@ -337,6 +338,56 @@ export async function runDailySummary(tenantId: string): Promise<TaskResult> {
 /* Dispatcher                                                           */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Customer support, grounded in the business's own recorded facts.
+ *
+ * The AI decides nothing on its own: it retrieves through the tool allowlist,
+ * and the grounding layer decides whether the answer may be sent at all. An
+ * ungrounded answer escalates rather than reaching a customer.
+ */
+async function runCustomerQuestion(tenantId: string, task: Task): Promise<TaskResult> {
+  const db = await getDb();
+  const [tenant] = await db
+    .select({ name: tenants.name })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+
+  const question = task.requestText ?? task.title;
+  const outcome = await answerCustomerQuestion({ tenantId, taskId: task.id, question });
+
+  const data = {
+    verdict: outcome.verdict,
+    reason: outcome.reason,
+    citations: outcome.citations,
+    toolsUsed: outcome.toolsUsed,
+    provider: outcome.provider,
+    model: outcome.model,
+    totalTokens: outcome.totalTokens,
+    costMicros: outcome.costMicros,
+  };
+
+  if (outcome.verdict === "escalate") {
+    return {
+      summary: `Escalated to a human: ${outcome.reason}`,
+      data,
+      // Escalations are informational for us but they DO tell the customer
+      // someone is on it, so this is a deliverable message rather than a
+      // silent fail.
+      draftBody: escalationMessage(tenant?.name ?? "the business"),
+    };
+  }
+
+  return {
+    summary:
+      outcome.verdict === "answerable"
+        ? `Answered, grounded in ${outcome.citations.length} fact(s)`
+        : `Answered from background information (${outcome.citations.length} ref(s))`,
+    data,
+    draftBody: outcome.draft,
+  };
+}
+
 export async function executeTask(task: Task): Promise<TaskResult> {
   switch (task.kind) {
     case "sales_report":
@@ -347,6 +398,8 @@ export async function executeTask(task: Task): Promise<TaskResult> {
       return runLowStock(task.tenantId);
     case "daily_summary":
       return runDailySummary(task.tenantId);
+    case "customer_question":
+      return runCustomerQuestion(task.tenantId, task);
     default:
       return {
         summary: `No executor for ${task.kind} yet`,

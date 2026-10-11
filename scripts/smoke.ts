@@ -8,9 +8,18 @@
  * that delivery is what gets billed, and that the state machine refuses
  * shortcuts. Each one is asserted, not just exercised.
  */
-import { eq, like } from "drizzle-orm";
+import { and, eq, like } from "drizzle-orm";
 import { getDb } from "../src/db/client";
-import { authSessions, messages, tasks, tenants, usageLedger, users } from "../src/db/schema";
+import {
+  aiUsage,
+  authSessions,
+  messages,
+  products,
+  tasks,
+  tenants,
+  usageLedger,
+  users,
+} from "../src/db/schema";
 import { sendTask, handleInboundMessage } from "../src/domain/pipeline";
 import {
   approveTask,
@@ -25,12 +34,14 @@ import {
 import { IncoherentRateCardError, InvalidTransitionError, DEFAULT_RATE_CARD, assertRateCardCoherent, requiresApprovalFor } from "../src/domain/tasks";
 import { importCsv, parseDate } from "../src/domain/import";
 import { runDailySummaries } from "../src/domain/scheduler";
-import {
-  parseCsv,
-} from "../src/lib/csv";
+import { parseCsv } from "../src/lib/csv";
 import { verifyPassword, verifyPasswordWithFallback } from "../src/lib/auth/password";
 import { purgeExpiredSessions } from "../src/lib/auth/maintenance";
 import { DEMO_PASSWORD } from "../src/lib/auth/demo";
+import { answerCustomerQuestion, dayKey, tokensUsedToday } from "../src/ai/answer";
+import { evaluateGrounding } from "../src/ai/ground";
+import { runTool, type ToolFact } from "../src/ai/tools";
+import { hallucinatingPriceProvider, ScriptedProvider } from "../src/ai/scripted";
 
 let passed = 0;
 let failed = 0;
@@ -534,6 +545,223 @@ async function main() {
     purged >= 1 && sessionsAfter === sessionsBefore,
     `${sessionsBefore} -> ${sessionsAfter}, purged ${purged}`,
   );
+
+  /* -- 17. The grounding layer refuses to invent ---------------------- */
+  // The product claim is "it never makes up a price". It is enforced in code
+  // rather than by asking the model nicely, so it is testable with no key.
+  const priceFact: ToolFact = {
+    // No "fact:" prefix on the id: `[fact:...]` is the citation marker the
+    // model writes, and what sits inside the brackets is the fact id itself.
+    id: "price-1",
+    topic: "price",
+    tier: "authoritative",
+    subject: "Rice 50kg bag",
+    value: "48000.00 NGN",
+  };
+
+  check(
+    "an answer citing an authoritative price fact is answerable",
+    evaluateGrounding({
+      draft: "The Rice 50kg bag is 48,000.00 NGN [fact:price-1].",
+      question: "how much is rice?",
+      returnedFacts: [priceFact],
+    }).verdict === "answerable",
+  );
+
+  check(
+    "an invented price is refused",
+    evaluateGrounding({
+      draft: "Yes, that is ₦2,000 for the item.",
+      question: "how much is it?",
+      returnedFacts: [],
+    }).verdict === "escalate",
+  );
+
+  check(
+    "an invented price is refused even when other facts were returned",
+    evaluateGrounding({
+      draft: "We are open 8am. The price is ₦500.",
+      question: "are you open?",
+      returnedFacts: [
+        {
+          id: "fact:hours-1",
+          topic: "hours",
+          tier: "authoritative",
+          subject: "Opening hours",
+          value: "7am - 9pm",
+        },
+      ],
+    }).verdict === "escalate",
+  );
+
+  check(
+    "citing a fact no tool returned is refused",
+    evaluateGrounding({
+      draft: "Our policy is generous [fact:made-up-id].",
+      question: "what is your policy?",
+      returnedFacts: [],
+    }).verdict === "escalate",
+  );
+
+  check(
+    "a policy answered from prose alone is refused",
+    evaluateGrounding({
+      draft: "Returns are fine usually.",
+      question: "what is your returns policy?",
+      returnedFacts: [
+        {
+          id: "fact:faq-1",
+          topic: "faq",
+          tier: "informational",
+          subject: "About us",
+          value: "we are friendly",
+        },
+      ],
+    }).verdict === "escalate",
+  );
+
+  check(
+    "an ungrounded answer with no citations is refused",
+    evaluateGrounding({
+      draft: "Sure, no problem!",
+      question: "hi",
+      returnedFacts: [],
+    }).verdict === "escalate",
+  );
+
+  check(
+    "a provider failure escalates rather than answering",
+    evaluateGrounding({
+      draft: "",
+      question: "anything",
+      returnedFacts: [],
+      failureReason: "provider unavailable",
+    }).verdict === "escalate",
+  );
+
+  check(
+    "the model can hand over to a human",
+    evaluateGrounding({
+      draft: "Let me check.",
+      question: "q",
+      returnedFacts: [],
+      escalateToolReason: "customer asked for a manager",
+    }).verdict === "escalate",
+  );
+
+  /* -- 18. Tools cannot cross tenants ---------------------------------- */
+  // tenantId is injected from the verified session, never from arguments.
+  const ownStock = await runTool("check_stock", { tenantId: tenant.id }, { query: "Rice" });
+  check(
+    "a tool reads the caller's own tenant",
+    ownStock.ok && (ownStock.result.facts?.length ?? 0) > 0,
+  );
+
+  const smuggled = await runTool(
+    "check_stock",
+    { tenantId: tenant.id },
+    { query: "Rice", tenantId: "00000000-0000-0000-0000-000000000000" },
+  );
+  check(
+    "a tenantId smuggled into tool arguments is ignored",
+    smuggled.ok &&
+      JSON.stringify(smuggled.result.facts ?? []) ===
+        JSON.stringify(ownStock.ok ? ownStock.result.facts : null),
+  );
+
+  check(
+    "an unknown tool name is a readable error, not a crash",
+    !(await runTool("drop_all_tables", { tenantId: tenant.id }, {})).ok,
+  );
+
+  check(
+    "malformed tool arguments are rejected before any query",
+    !(await runTool("look_up_price", { tenantId: tenant.id }, { query: 12345 })).ok,
+  );
+
+  /* -- 19. Draft facts are invisible to the model ---------------------- */
+  const draftLookup = await runTool(
+    "look_up_price",
+    { tenantId: tenant.id },
+    { query: "Wholesale" },
+  );
+  check(
+    "an unpublished (draft) fact is never returned to the model",
+    draftLookup.ok && (draftLookup.result.facts?.length ?? 0) === 0,
+  );
+
+  /* -- 20. Provider failure degrades, never crashes ------------------- */
+  const outage = await answerCustomerQuestion(
+    { tenantId: tenant.id, question: "how much is rice?" },
+    new ScriptedProvider([
+      { error: { message: "upstream 503", kind: "unavailable" } },
+    ]),
+  );
+  check("a provider outage escalates instead of throwing", outage.verdict === "escalate");
+  check("the failure reason is recorded", outage.reason.includes("upstream 503"));
+
+  /* -- 21. A hallucinating provider is caught end to end -------------- */
+  const hallucinated = await answerCustomerQuestion(
+    { tenantId: tenant.id, question: "how much is the special pack?" },
+    hallucinatingPriceProvider("₦2,000"),
+  );
+  check(
+    "a confident, wrong price never reaches the customer",
+    hallucinated.verdict === "escalate" && hallucinated.draft === "",
+    `verdict=${hallucinated.verdict}`,
+  );
+
+  /* -- 22. A grounded answer is delivered ----------------------------- */
+  const [rice] = await db
+    .select({ id: products.id })
+    .from(products)
+    .where(eq(products.sku, "RICE-50"))
+    .limit(1);
+
+  const grounded = await answerCustomerQuestion(
+    { tenantId: tenant.id, question: "how much is rice?" },
+    new ScriptedProvider([
+      { toolCalls: [{ id: "c1", name: "look_up_price", arguments: { query: "Rice" } }] },
+      {
+        content: `The Rice 50kg bag is 48,000.00 NGN per bag [fact:product:${rice!.id}].`,
+      },
+    ]),
+  );
+  check(
+    "an answer backed by a tool fact is deliverable",
+    grounded.verdict === "answerable" && grounded.draft.length > 0,
+    `verdict=${grounded.verdict}, reason=${grounded.reason}`,
+  );
+  check(
+    "tool use and token cost are recorded for calibration",
+    grounded.toolsUsed.includes("look_up_price") && grounded.totalTokens > 0,
+  );
+
+  /* -- 23. Budget stops the spending before it happens ---------------- */
+  await db.insert(aiUsage).values({
+    tenantId: tenant.id,
+    provider: "nvidia",
+    model: "test",
+    totalTokens: 999_999,
+    costMicros: 1,
+    day: dayKey(),
+    outcome: "ok",
+  });
+
+  const exhausted = await answerCustomerQuestion({
+    tenantId: tenant.id,
+    question: "how much is rice?",
+  });
+  check(
+    "an exhausted budget blocks the provider call entirely",
+    exhausted.verdict === "escalate" && exhausted.totalTokens === 0,
+    exhausted.reason,
+  );
+  check("budget exhaustion is reported, not silent", exhausted.reason.includes("budget"));
+
+  await db
+    .delete(aiUsage)
+    .where(and(eq(aiUsage.tenantId, tenant.id), eq(aiUsage.totalTokens, 999_999)));
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   process.exit(failed > 0 ? 1 : 0);

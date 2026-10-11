@@ -117,6 +117,57 @@ documented `db:seed && dev` flow needs no extra step.
 > "Access is denied (os error 5)", run `npm run dev:webpack` — Webpack
 > externalises server dependencies without touching the filesystem.
 
+## The AI layer
+
+The assistant **understands**; the application **decides and executes**. The
+model never gets database access or the ability to run code — it chooses from a
+fixed tool allowlist, and a grounding layer decides whether anything it wrote
+may reach a customer.
+
+```
+provider (NVIDIA NIM) -> tool allowlist -> provider -> grounding -> send or escalate
+```
+
+### Grounding: what makes the claim true
+
+The claim is "it never invents a price". A prompt instruction cannot deliver
+that, so `src/ai/ground.ts` enforces it against the facts the tools actually
+returned, using no model judgement:
+
+- an invented currency amount is refused, even when other facts were returned
+- a citation no tool produced is refused
+- a commitment topic (price, hours, policy, delivery, location) answered from
+  prose is refused
+- an answer with no grounding is refused
+- any provider failure, or an exhausted budget, escalates rather than answering
+
+`npm run smoke` proves all of this **without an API key**, using a scripted
+provider — including a deliberately confident, wrong one.
+
+### Two tiers of business knowledge
+
+| Tier | Example | The model may... |
+| --- | --- | --- |
+| `authoritative` | opening hours, returns policy, delivery fee | state it, and must cite it |
+| `informational` | tone of voice, "about us", general FAQs | read for context, never quote as fact |
+
+Only `status = 'active'` facts reach the model, so publishing a fact is a
+deliberate act. The seed includes a `draft` wholesale-pricing fact to prove it
+stays invisible.
+
+### Tools cannot cross tenants
+
+`tenantId` is not a tool argument — it is injected from the verified session, so
+the model has no parameter through which to ask for another business's data.
+Arguments are zod-validated before any query runs.
+
+### Cost
+
+Token usage is recorded in `ai_usage` **but never billed**; the customer is
+still metered per completed task. This exists so the billable weights can be
+set from measured numbers during the pilot rather than guessed. A per-tenant
+daily budget stops the spending before it happens.
+
 ## Scripts
 
 | Command | Purpose |
@@ -214,6 +265,14 @@ exercising code paths:
 - the daily summary runs once, not twice
 - **a simulated message for tenant B lands in tenant B, never tenant A**
 - the seeded owner can actually sign in with the documented password
+- **an invented price is refused**, even when other facts were returned
+- a commitment topic answered from prose alone is refused
+- a citation no tool produced is refused
+- a confident hallucinating provider never reaches a customer
+- a tool cannot be made to read another tenant, even with `tenantId` smuggled
+  into its arguments
+- an unpublished (draft) fact is invisible to the model
+- a provider outage or an exhausted budget escalates instead of crashing
 - every transition lands in the audit log
 
 ## Connecting real WhatsApp

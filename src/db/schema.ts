@@ -87,6 +87,117 @@ export const orderStatus = pgEnum("order_status", [
 export const userRole = pgEnum("user_role", ["owner", "manager", "staff"]);
 
 /* ------------------------------------------------------------------ */
+/* Business knowledge (the grounding layer)                            */
+/* ------------------------------------------------------------------ */
+
+export const factTopic = pgEnum("fact_topic", [
+  "price",
+  "service",
+  "hours",
+  "location",
+  "policy",
+  "contact",
+  "delivery",
+  "faq",
+]);
+
+/**
+ * The single most important distinction in the AI layer.
+ *
+ * `authoritative` facts are the business's system of record. The model may
+ * state them, and every answer that does must cite them.
+ *
+ * `informational` facts are prose: tone, FAQs, background. The model may read
+ * them for context but may never quote them as fact. Asking "what is your
+ * return policy?" and answering from a prose FAQ is how a business gets a
+ * promise it never made.
+ */
+export const factTier = pgEnum("fact_tier", ["authoritative", "informational"]);
+
+/** Only `active` facts may be used. Drafts are invisible to the model. */
+export const factStatus = pgEnum("fact_status", ["active", "draft", "archived"]);
+
+export const businessFacts = pgTable(
+  "business_facts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    topic: factTopic("topic").notNull(),
+    tier: factTier("tier").notNull().default("informational"),
+    status: factStatus("status").notNull().default("draft"),
+    /** What this is about, e.g. "Rice 50kg bag", "Returns", "Opening hours". */
+    subject: text("subject").notNull(),
+    /** The authoritative content. */
+    value: text("value").notNull(),
+    /** Machine-readable payload, e.g. { amountMinor, currency } for prices. */
+    structured: jsonb("structured").$type<Record<string, unknown>>().notNull().default({}),
+    /** Where it came from -- who wrote it, which import, which source. */
+    provenance: text("provenance"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("business_facts_tenant_topic_idx").on(t.tenantId, t.topic),
+    index("business_facts_tenant_status_idx").on(t.tenantId, t.status),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Platform AI configuration                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Platform-level settings for the AI layer: default model, budgets, limits.
+ * Global, not per-tenant -- tenant admins must never reach provider
+ * credentials or platform policy.
+ */
+export const platformSettings = pgTable("platform_settings", {
+  key: text("key").primaryKey(),
+  value: jsonb("value").$type<Record<string, unknown>>().notNull().default({}),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * Token accounting for the AI layer.
+ *
+ * Recorded for cost control and calibration, NOT billed to the customer.
+ * The customer is metered per completed task; this exists so the billable
+ * weights can eventually be set from measured cost rather than a guess.
+ *
+ * `costMicros` keeps money in integers (1 USD = 1,000,000 micros), because
+ * token costs are fractional and floats must never reach a ledger.
+ */
+export const aiUsage = pgTable(
+  "ai_usage",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+    provider: text("provider").notNull(),
+    model: text("model").notNull(),
+    promptTokens: integer("prompt_tokens").notNull().default(0),
+    completionTokens: integer("completion_tokens").notNull().default(0),
+    totalTokens: integer("total_tokens").notNull().default(0),
+    costMicros: integer("cost_micros").notNull().default(0),
+    /** Call index within a single answer, so multi-round tool use is visible. */
+    round: integer("round").notNull().default(0),
+    /** "ok" | "provider_error" | "budget_exceeded" | "ungrounded" */
+    outcome: text("outcome").notNull().default("ok"),
+    /** Day key, YYYY-MM-DD, for daily budget enforcement. */
+    day: text("day").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("ai_usage_tenant_day_idx").on(t.tenantId, t.day),
+    index("ai_usage_day_idx").on(t.day),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
 /* Tenancy + people                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -509,6 +620,10 @@ export type TaskEvent = typeof taskEvents.$inferSelect;
 export type UsageLedgerEntry = typeof usageLedger.$inferSelect;
 export type User = typeof users.$inferSelect;
 export type WhatsappLink = typeof whatsappLinks.$inferSelect;
+export type FactTopic = (typeof factTopic.enumValues)[number];
+export type FactTier = (typeof factTier.enumValues)[number];
+export type BusinessFact = typeof businessFacts.$inferSelect;
+export type AiUsageEntry = typeof aiUsage.$inferSelect;
 export type TaskKind = (typeof taskKind.enumValues)[number];
 export type TaskStatus = (typeof taskStatus.enumValues)[number];
 export type TaskOrigin = (typeof taskOrigin.enumValues)[number];

@@ -22,6 +22,13 @@
       "when": 1791541462494,
       "tag": "0002_real_auth_sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791707951381,
+      "tag": "0003_complete_puma",
+      "breakpoints": true
     }
   ]
 }

@@ -13,6 +13,7 @@ import { DEFAULT_RATE_CARD } from "../domain/tasks";
 import { hashPassword } from "../lib/auth/password";
 import { DEMO_EMAIL, DEMO_PASSWORD } from "../lib/auth/demo";
 import {
+  businessFacts,
   contacts,
   invoices,
   orderItems,
@@ -85,6 +86,7 @@ export async function seed() {
   if (existing) {
     console.log("  tenant already present -- clearing demo data");
     await db.delete(tasks);
+    await db.delete(businessFacts);
     await db.delete(orderItems);
     await db.delete(orders);
     await db.delete(invoices);
@@ -259,6 +261,109 @@ export async function seed() {
       issuedOn: new Date(now - 5 * 86_400_000),
       dueOn: new Date(now + 9 * 86_400_000),
       status: "sent",
+    },
+  ]);
+
+  await db.insert(businessFacts).values([
+    // -- Authoritative: quotable as fact, must be cited by the model. --
+    {
+      tenantId: tenant.id,
+      topic: "hours",
+      tier: "authoritative",
+      status: "active",
+      subject: "Opening hours",
+      value:
+        "Monday to Saturday, 7:00am - 9:00pm. Sunday, 9:00am - 6:00pm.",
+      provenance: "seed",
+    },
+    {
+      tenantId: tenant.id,
+      topic: "location",
+      tier: "authoritative",
+      status: "active",
+      subject: "Location",
+      value: "12 Adeola Odeku Street, Victoria Island, Lagos.",
+      provenance: "seed",
+    },
+    {
+      tenantId: tenant.id,
+      topic: "contact",
+      tier: "authoritative",
+      status: "active",
+      subject: "Phone",
+      value: "+234 801 000 0001",
+      provenance: "seed",
+    },
+    {
+      tenantId: tenant.id,
+      topic: "delivery",
+      tier: "authoritative",
+      status: "active",
+      subject: "Delivery",
+      value:
+        "Same-day delivery within Lagos for orders over ₦20,000. " +
+        "Delivery fee is ₦1,000.",
+      provenance: "seed",
+    },
+    {
+      tenantId: tenant.id,
+      topic: "policy",
+      tier: "authoritative",
+      status: "active",
+      subject: "Returns",
+      value:
+        "Unopened perishable items cannot be returned. Non-perishable items " +
+        "may be returned within 7 days with a receipt.",
+      provenance: "seed",
+    },
+
+    // -- Informational: background only. Never quotable as fact. --
+    {
+      tenantId: tenant.id,
+      topic: "faq",
+      tier: "informational",
+      status: "active",
+      subject: "Tone of voice",
+      value:
+        "Warm and neighbourly. Speak in plain Nigerian English, avoid " +
+        "corporate phrasing, and never overpromise.",
+      provenance: "seed",
+    },
+    {
+      tenantId: tenant.id,
+      topic: "faq",
+      tier: "informational",
+      status: "active",
+      subject: "About us",
+      value:
+        "A family-run neighbourhood market that has served Ojota for over " +
+        "15 years, stocking daily essentials alongside bulk food items.",
+      provenance: "seed",
+    },
+    {
+      tenantId: tenant.id,
+      topic: "faq",
+      tier: "informational",
+      status: "active",
+      subject: "Bargaining",
+      value:
+        "Customers sometimes ask for a better price at the counter. This " +
+        "assistant should not negotiate; a human handles discounts.",
+      provenance: "seed",
+    },
+
+    // -- Draft: invisible to the AI until published. --
+    {
+      tenantId: tenant.id,
+      topic: "price",
+      tier: "authoritative",
+      status: "draft",
+      subject: "Wholesale pricing",
+      value:
+        "Wholesale discount tiers are under review. Do not publish any " +
+        "wholesale price until this is approved.",
+      provenance: "seed",
+      structured: { pendingApproval: true },
     },
   ]);
 
