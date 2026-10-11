@@ -98,6 +98,10 @@ export async function handleInboundMessage(
 ): Promise<InboundOutcome> {
   const db = await getDb();
 
+  // A blank message is not a task. Some clients send empty payloads, and
+  // metering one would burn the business's allowance on nothing.
+  if (!ctx.body.trim()) return EMPTY;
+
   if (await isDuplicate(ctx.messageId)) return EMPTY;
 
   const tenant = await resolveTenant(ctx);
@@ -162,6 +166,9 @@ export async function handleInboundMessage(
       // Customer-facing replies are always consequential: a price or promise
       // made to a customer is the shop's word, not ours.
       requiresApproval: !isOwner || plan.kind !== "sales_report",
+      // Greetings and acknowledgements still get an audit row, but must not
+      // consume the shop's plan allowance.
+      isBillable: plan.billable ?? true,
     });
 
     // Inline for now. Production moves this to a durable queue

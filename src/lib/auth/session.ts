@@ -1,7 +1,7 @@
 import "server-only";
 import { createHash, randomBytes } from "node:crypto";
 import { cookies } from "next/headers";
-import { and, eq, gt } from "drizzle-orm";
+import { and, eq, gt, lt } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { authSessions, tenants, users } from "@/db/schema";
 
@@ -13,8 +13,16 @@ export type AuthActor = { userId: string; tenantId: string; name: string; email:
 
 export async function createSession(userId: string): Promise<void> {
   const db = await getDb();
+  const now = new Date();
+
+  // Keep a user's own rows bounded before adding another, so the table does
+  // not grow without limit just from people signing in repeatedly.
+  await db
+    .delete(authSessions)
+    .where(and(eq(authSessions.userId, userId), lt(authSessions.expiresAt, now)));
+
   const token = randomBytes(32).toString("base64url");
-  const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000);
+  const expiresAt = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1000);
   await db.insert(authSessions).values({ userId, tokenHash: hashToken(token), expiresAt });
   const cookieStore = await cookies();
   cookieStore.set(COOKIE_NAME, token, {
@@ -25,6 +33,12 @@ export async function createSession(userId: string): Promise<void> {
     expires: expiresAt,
   });
 }
+
+/**
+ * Expired sessions are swept by `purgeExpiredSessions` in
+ * `./maintenance`, which this module cannot host because `server-only` makes
+ * it unimportable from scripts and scheduled jobs.
+ */
 
 export async function getCurrentActor(): Promise<AuthActor | null> {
   const cookieStore = await cookies();

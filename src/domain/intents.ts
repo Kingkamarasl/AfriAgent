@@ -52,6 +52,28 @@ export interface PlannedTask {
   title: string;
   requestText: string;
   input: Record<string, unknown>;
+  /**
+   * Whether this is worth charging for. Greetings, acknowledgements and
+   * emoji still get a task so there is an audit trail, but they must not
+   * consume the customer's plan allowance.
+   */
+  billable?: boolean;
+}
+
+/**
+ * Messages that carry no work.
+ *
+ * Without this, every "ok" or 👍 a customer sends becomes a billable task. The
+ * business sees their allowance draining on noise and blames the agent.
+ */
+const LOW_VALUE_PATTERN =
+  /^(hi|hey|hello|yo|sup|ok|okay|k|kk|yes|yeah|no|nope|nah|sure|thanks|thank ?u|ty|cheers|great|perfect|awesome|nice|good (morning|afternoon|evening|night|day)|dear|please|pls)\b|^[\p{So}\p{Sk}]+$/iu;
+
+export function isLowValueMessage(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  if (trimmed.length > 60) return false; // Long enough to hide real intent.
+  return LOW_VALUE_PATTERN.test(trimmed);
 }
 
 interface Rule {
@@ -130,6 +152,7 @@ export function routeMessage(text: string): PlannedTask[] {
   const clauses = splitIntents(text);
   const planned: PlannedTask[] = [];
   const seen = new Set<TaskKind>();
+  const billable = !isLowValueMessage(text);
 
   for (const clause of clauses.length ? clauses : [text]) {
     const rule = OWNER_RULES.find((r) => r.test.test(clause));
@@ -140,6 +163,7 @@ export function routeMessage(text: string): PlannedTask[] {
       title: rule.title,
       requestText: clause,
       input: rule.input ?? {},
+      billable,
     });
   }
 
@@ -149,6 +173,7 @@ export function routeMessage(text: string): PlannedTask[] {
       title: "Unrecognised request",
       requestText: text,
       input: {},
+      billable,
     });
   }
 
@@ -195,7 +220,14 @@ export function routeCustomerMessage(text: string): PlannedTask {
       title: "Customer question",
       requestText: text,
       input: {},
+      billable: !isLowValueMessage(text),
     };
   }
-  return { kind: rule.kind, title: rule.title, requestText: text, input: {} };
+  return {
+    kind: rule.kind,
+    title: rule.title,
+    requestText: text,
+    input: {},
+    billable: !isLowValueMessage(text),
+  };
 }

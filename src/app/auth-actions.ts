@@ -7,7 +7,7 @@ import { redirect } from "next/navigation";
 import { getDb } from "@/db/client";
 import { tenants, users } from "@/db/schema";
 import { createSession, destroyCurrentSession, getCurrentActor } from "@/lib/auth/session";
-import { hashPassword, verifyPassword } from "@/lib/auth/password";
+import { hashPassword, verifyPasswordWithFallback } from "@/lib/auth/password";
 
 export type AuthFormState = { error?: string };
 const normaliseEmail = (value: FormDataEntryValue | null) => String(value ?? "").trim().toLowerCase();
@@ -61,8 +61,10 @@ export async function loginAction(_previous: AuthFormState, formData: FormData):
   if (!emailPattern.test(email) || !password || password.length > 128) return { error: "Enter your email and password." };
   const db = await getDb();
   const [user] = await db.select({ id: users.id, passwordHash: users.passwordHash }).from(users).where(eq(users.email, email)).limit(1);
-  // Keep the public error identical for unknown users and wrong passwords.
-  if (!user?.passwordHash || !(await verifyPassword(password, user.passwordHash))) return { error: "Email or password is incorrect." };
+  // Identical message AND identical timing for unknown-address and
+  // wrong-password; see `verifyPasswordWithFallback`.
+  const passwordOk = await verifyPasswordWithFallback(password, user?.passwordHash);
+  if (!user || !passwordOk) return { error: "Email or password is incorrect." };
   await createSession(user.id);
   revalidatePath("/");
   redirect("/");

@@ -24,3 +24,30 @@ export async function verifyPassword(password: string, stored: string): Promise<
     return false;
   }
 }
+
+/**
+ * A syntactically valid hash that matches no password, at the same cost as a
+ * real one. 16-byte salt and 64-byte digest, so `verifyPassword` does exactly
+ * the same amount of PBKDF2 work against it as against a stored credential.
+ */
+const TIMING_EQUALISER = `pbkdf2-sha512$${ITERATIONS}$${"00".repeat(16)}$${"00".repeat(64)}`;
+
+/**
+ * Constant-time-ish credential check.
+ *
+ * `verifyPassword` alone leaks whether an address exists: for an unknown
+ * email the caller returns immediately and skips ~310k PBKDF2 iterations, so
+ * the response is measurably faster than a wrong password on a real account.
+ * The public error message is already identical for both cases; this makes the
+ * *timing* identical too.
+ *
+ * Always returns false when there is no stored hash -- there is nothing to
+ * compare against, and burning the time is the entire point.
+ */
+export async function verifyPasswordWithFallback(
+  password: string,
+  stored: string | null | undefined,
+): Promise<boolean> {
+  const valid = await verifyPassword(password, stored ?? TIMING_EQUALISER);
+  return stored ? valid : false;
+}

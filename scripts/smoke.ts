@@ -10,7 +10,7 @@
  */
 import { eq, like } from "drizzle-orm";
 import { getDb } from "../src/db/client";
-import { messages, tasks, tenants, usageLedger, users } from "../src/db/schema";
+import { authSessions, messages, tasks, tenants, usageLedger, users } from "../src/db/schema";
 import { sendTask, handleInboundMessage } from "../src/domain/pipeline";
 import {
   approveTask,
@@ -28,7 +28,8 @@ import { runDailySummaries } from "../src/domain/scheduler";
 import {
   parseCsv,
 } from "../src/lib/csv";
-import { verifyPassword } from "../src/lib/auth/password";
+import { verifyPassword, verifyPasswordWithFallback } from "../src/lib/auth/password";
+import { purgeExpiredSessions } from "../src/lib/auth/maintenance";
 import { DEMO_PASSWORD } from "../src/lib/auth/demo";
 
 let passed = 0;
@@ -36,6 +37,8 @@ let failed = 0;
 
 /** The seeded owner's WhatsApp wa_id. */
 const OWNER_WA_ID = "2348010000001";
+/** A customer of the seeded shop. */
+const CUSTOMER_WA_ID = "2348020000002";
 
 function check(name: string, condition: boolean, detail?: string) {
   if (condition) {
@@ -407,10 +410,11 @@ async function main() {
   // The dashboard resolves its tenant from a session, so a seeded demo shop
   // with no credentials is unreachable and its sample data is invisible.
   const [seededOwner] = await db
-    .select({ email: users.email, passwordHash: users.passwordHash })
+    .select({ id: users.id, email: users.email, passwordHash: users.passwordHash })
     .from(users)
     .where(eq(users.tenantId, tenant.id))
     .limit(1);
+  const seededOwnerId = seededOwner!.id;
 
   check(
     "the seeded owner has credentials to sign in with",
@@ -429,6 +433,106 @@ async function main() {
       seededOwner?.passwordHash &&
         !(await verifyPassword("not-the-password", seededOwner.passwordHash)),
     ),
+  );
+
+  /* -- 14. Auth does not leak which addresses exist ------------------- */
+  // The public error message was already identical for both cases, but the
+  // unknown-address path returned without running PBKDF2 at all -- measurably
+  // faster, which is an enumeration oracle.
+  const before = process.hrtime.bigint();
+  await verifyPasswordWithFallback("password-for-timing", null);
+  const unknownMs = Number(process.hrtime.bigint() - before) / 1e6;
+
+  const before2 = process.hrtime.bigint();
+  await verifyPasswordWithFallback("password-for-timing", seededOwner!.passwordHash!);
+  const knownMs = Number(process.hrtime.bigint() - before2) / 1e6;
+
+  check(
+    "an unknown address still pays the PBKDF2 cost",
+    unknownMs > 50,
+    `unknown took ${unknownMs.toFixed(0)}ms, known took ${knownMs.toFixed(0)}ms`,
+  );
+  check(
+    "unknown and known addresses take comparable time",
+    Math.abs(unknownMs - knownMs) / Math.max(unknownMs, knownMs) < 0.75,
+    `${unknownMs.toFixed(0)}ms vs ${knownMs.toFixed(0)}ms`,
+  );
+  check(
+    "a missing stored hash never authenticates",
+    !(await verifyPasswordWithFallback("anything", null)) &&
+      !(await verifyPasswordWithFallback("anything", undefined)),
+  );
+
+  /* -- 15. Noise is not billed --------------------------------------- */
+  // "ok" and a thumbs-up must not consume the shop's allowance, or the first
+  // thing a business notices is their plan draining on greetings.
+  const noise = await handleInboundMessage({
+    waId: CUSTOMER_WA_ID,
+    body: "ok",
+    messageId: `wamid.SMOKE.${crypto.randomUUID()}`,
+    timestamp: new Date(),
+    tenantId: tenant.id,
+  });
+
+  check(
+    "a greeting creates a task but is not billable",
+    noise.taskIds.length === 1 &&
+      (await getTask(noise.taskIds[0]!))?.isBillable === false,
+  );
+
+  const usageBeforeNoise = (await summariseUsage(tenant.id)).units;
+  // Approve first: the state machine correctly refuses
+  // pending_approval -> sending, which is the gate working.
+  await approveTask(noise.taskIds[0]!, seededOwnerId);
+  await sendTask(noise.taskIds[0]!, { dryRun: true });
+  const usageAfterNoise = (await summariseUsage(tenant.id)).units;
+  check(
+    "delivering a non-billable task adds nothing to the ledger",
+    usageBeforeNoise === usageAfterNoise,
+    `${usageBeforeNoise} -> ${usageAfterNoise}`,
+  );
+
+  const real = await handleInboundMessage({
+    waId: CUSTOMER_WA_ID,
+    body: "Do you have Peak milk powder in stock?",
+    messageId: `wamid.SMOKE.${crypto.randomUUID()}`,
+    timestamp: new Date(),
+    tenantId: tenant.id,
+  });
+  check(
+    "a real question is still billable",
+    real.taskIds.length > 0 &&
+      (await getTask(real.taskIds[0]!))?.isBillable === true,
+  );
+
+  const blank = await handleInboundMessage({
+    waId: CUSTOMER_WA_ID,
+    body: "   ",
+    messageId: `wamid.SMOKE.${crypto.randomUUID()}`,
+    timestamp: new Date(),
+    tenantId: tenant.id,
+  });
+  check("a blank message creates no task at all", blank.taskIds.length === 0);
+
+  /* -- 16. Expired sessions are swept -------------------------------- */
+  const sessionsBefore = (
+    await db.select({ id: authSessions.id }).from(authSessions)
+  ).length;
+  if (sessionsBefore === 0) {
+    await db.insert(authSessions).values({
+      userId: seededOwnerId,
+      tokenHash: `expired-${crypto.randomUUID()}`,
+      expiresAt: new Date(Date.now() - 1000),
+    });
+  }
+  const purged = await purgeExpiredSessions();
+  const sessionsAfter = (
+    await db.select({ id: authSessions.id }).from(authSessions)
+  ).length;
+  check(
+    "expired sessions are purged",
+    purged >= 1 && sessionsAfter === sessionsBefore,
+    `${sessionsBefore} -> ${sessionsAfter}, purged ${purged}`,
   );
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

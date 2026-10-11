@@ -1,4 +1,5 @@
 import { runDailySummaries } from "@/domain/scheduler";
+import { purgeExpiredSessions } from "@/lib/auth/maintenance";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,12 +37,14 @@ export async function GET(request: Request) {
   }
 
   const results = await runDailySummaries();
+  const purgedSessions = await purgeExpiredSessions();
 
   return Response.json({
     ok: true,
     ran: results.filter((r) => r.status === "ran").length,
     skipped: results.filter((r) => r.status === "skipped").length,
     failed: results.filter((r) => r.status === "failed").length,
+    purgedSessions,
     results,
   });
 }
