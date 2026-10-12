@@ -36,6 +36,13 @@
       "when": 1791709457333,
       "tag": "0004_lame_ego",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1791797467826,
+      "tag": "0005_friendly_jetstream",
+      "breakpoints": true
     }
   ]
 }

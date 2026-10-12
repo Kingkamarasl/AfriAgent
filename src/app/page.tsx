@@ -9,6 +9,7 @@ import { ImportPanel } from "@/components/ImportPanel";
 import { ApprovalCard } from "@/components/ApprovalCard";
 import { RetryButton } from "@/components/RetryButton";
 import { AppNav } from "@/components/AppNav";
+import { VerifyEmailBanner } from "@/components/VerifyEmailBanner";
 import {
   listApprovalQueue,
   recentActivity,
@@ -139,6 +140,7 @@ export default async function DashboardPage() {
 
       <main className="mx-auto grid max-w-7xl gap-6 px-6 py-6 lg:grid-cols-[380px_1fr]">
         <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
+          {!actor.emailVerified && <VerifyEmailBanner />}
           <Playground />
           <ImportPanel />
 

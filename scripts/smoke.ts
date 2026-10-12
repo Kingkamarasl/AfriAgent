@@ -13,7 +13,9 @@ import { getDb } from "../src/db/client";
 import {
   aiUsage,
   authSessions,
+  authTokens,
   businessFacts,
+  loginAttempts,
   messages,
   products,
   tasks,
@@ -55,6 +57,20 @@ import {
   setFactStatus,
   updateFact,
 } from "../src/domain/knowledge";
+import {
+  checkLoginThrottle,
+  clearLoginAttempts,
+  purgeLoginAttempts,
+  recordLoginAttempt,
+  THRESHOLDS,
+} from "../src/lib/auth/rate-limit";
+import {
+  checkAuthToken,
+  consumeAuthToken,
+  createAuthToken,
+  isEmailVerified,
+} from "../src/lib/auth/tokens";
+import { destroyAllSessions } from "../src/lib/auth/maintenance";
 
 let passed = 0;
 let failed = 0;
@@ -1014,6 +1030,129 @@ async function main() {
 
   await deleteFact(tenant.id, (authored as { id: string }).id);
   await db.delete(tenants).where(eq(tenants.id, rivalWrite!.id));
+
+  /* -- 28. Login throttling ------------------------------------------ */
+  // Credential stuffing is the likelier threat here, not privilege escalation.
+  // Two independent counters, because either one alone is trivially routed
+  // around.
+  const probe = { email: "throttle-probe@ojota.local", ip: "203.0.113.9" };
+  await clearLoginAttempts(probe);
+  check("a fresh identity is not throttled", !(await checkLoginThrottle(probe)).blocked);
+
+  for (let i = 0; i < THRESHOLDS.perEmail; i++) {
+    await recordLoginAttempt({ ...probe, succeeded: false });
+  }
+
+  const throttled = await checkLoginThrottle(probe);
+  check("repeated failures lock the identity out", throttled.blocked, `reason=${throttled.reason}`);
+  check("the lockout says how long to wait", (throttled.retryAfterSeconds ?? 0) > 0);
+
+  // Rotating IP must not help an attacker targeting the same account...
+  const rotatedIp = await checkLoginThrottle({
+    email: probe.email,
+    ip: "198.51.100.4",
+  });
+  check("rotating IP does not defeat the per-email limit", rotatedIp.blocked, `reason=${rotatedIp.reason}`);
+
+  // ...and a different account must not help them from the same host.
+  const otherAccount = { email: "spray-target@ojota.local", ip: probe.ip };
+  check("a different account on the same host is unaffected", !(await checkLoginThrottle(otherAccount)).blocked);
+
+  for (let i = 0; i < THRESHOLDS.perIp; i++) {
+    await recordLoginAttempt({ email: `spray-${i}@ojota.local`, ip: probe.ip, succeeded: false });
+  }
+  check(
+    "spraying many accounts from one host trips the per-IP limit",
+    (await checkLoginThrottle({ email: "brand-new@ojota.local", ip: probe.ip })).blocked,
+  );
+
+  await clearLoginAttempts(probe);
+  check(
+    "a successful sign-in clears the failure count",
+    !(await checkLoginThrottle({ email: probe.email, ip: "203.0.113.9" })).blocked,
+  );
+
+  await db.delete(loginAttempts);
+  for (let i = 0; i < 3; i++) {
+    await recordLoginAttempt({ email: `purge-${i}@x.com`, ip: "198.51.100.77", succeeded: false });
+  }
+  check("expired attempts are swept by the cron", (await purgeLoginAttempts(new Date(Date.now() + 1000))) > 0);
+
+  /* -- 29. Password recovery ----------------------------------------- */
+  check("the seeded owner is verified", await isEmailVerified(seededOwnerId));
+
+  const resetToken = await createAuthToken(seededOwnerId, "password_reset");
+  check("a reset link validates before it is used", (await checkAuthToken(resetToken, "password_reset")).ok);
+
+  const verifyToken = await createAuthToken(seededOwnerId, "verify_email");
+  check(
+    "a reset token cannot be used to verify an email",
+    !(await checkAuthToken(resetToken, "verify_email")).ok,
+  );
+  check(
+    "a verification token cannot reset a password",
+    !(await checkAuthToken(verifyToken, "password_reset")).ok,
+  );
+
+  check("the token is consumable once", await consumeAuthToken(resetToken, "password_reset"));
+  check("and not twice", !(await consumeAuthToken(resetToken, "password_reset")));
+
+  const reused = await checkAuthToken(resetToken, "password_reset");
+  check(
+    "a used token says it was used, not that it is invalid",
+    !reused.ok && (reused as { reason: string }).reason === "already_used",
+  );
+
+  check("a made-up token is rejected", !(await checkAuthToken("nope", "password_reset")).ok);
+
+  // Expiry: expire every outstanding reset token for this user.
+  const doomed = await createAuthToken(seededOwnerId, "password_reset");
+  await db
+    .update(authTokens)
+    .set({ expiresAt: new Date(Date.now() - 1000) })
+    .where(eq(authTokens.userId, seededOwnerId));
+  check(
+    "an expired token is refused",
+    !(await checkAuthToken(doomed, "password_reset")).ok,
+  );
+  check(
+    "and cannot be consumed",
+    !(await consumeAuthToken(doomed, "password_reset")),
+  );
+
+  // Issuing a new link invalidates the old one, so a forwarded link dies.
+  const oldToken = await createAuthToken(seededOwnerId, "password_reset");
+  await createAuthToken(seededOwnerId, "password_reset");
+  const oldCheck = await checkAuthToken(oldToken, "password_reset");
+  check(
+    "issuing a new link invalidates the previous one",
+    !oldCheck.ok && (oldCheck as { reason: string }).reason === "already_used",
+  );
+
+  /* -- 30. A reset kills every existing session ----------------------- */
+  // The most important line in the reset flow: a stolen cookie must not
+  // outlive the password it was issued against.
+  await db.insert(authSessions).values([
+    { userId: seededOwnerId, tokenHash: `sess-a-${crypto.randomUUID()}`, expiresAt: new Date(Date.now() + 86_400_000) },
+    { userId: seededOwnerId, tokenHash: `sess-b-${crypto.randomUUID()}`, expiresAt: new Date(Date.now() + 86_400_000) },
+  ]);
+
+  const beforeReset = (
+    await db.select({ id: authSessions.id }).from(authSessions).where(eq(authSessions.userId, seededOwnerId))
+  ).length;
+  const killed = await destroyAllSessions(seededOwnerId);
+  const afterReset = (
+    await db.select({ id: authSessions.id }).from(authSessions).where(eq(authSessions.userId, seededOwnerId))
+  ).length;
+
+  check("sessions exist before the reset", beforeReset >= 2, `${beforeReset}`);
+  check(
+    "a password reset kills every session",
+    afterReset === 0 && killed === beforeReset,
+    `${beforeReset} -> ${afterReset}`,
+  );
+
+  await db.delete(authTokens);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   process.exit(failed > 0 ? 1 : 0);

@@ -9,7 +9,7 @@ const COOKIE_NAME = "afriagent_session";
 const SESSION_DAYS = 14;
 const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 
-export type AuthActor = { userId: string; tenantId: string; name: string; email: string; role: "owner" | "manager" | "staff"; tenantName: string; tenantSlug: string };
+export type AuthActor = { userId: string; tenantId: string; name: string; email: string; role: "owner" | "manager" | "staff"; tenantName: string; tenantSlug: string; emailVerified: boolean };
 
 export async function createSession(userId: string): Promise<void> {
   const db = await getDb();
@@ -45,15 +45,22 @@ export async function getCurrentActor(): Promise<AuthActor | null> {
   const token = cookieStore.get(COOKIE_NAME)?.value;
   if (!token || token.length > 200) return null;
   const db = await getDb();
-  const [row] = await db.select({ userId: users.id, tenantId: users.tenantId, name: users.name, email: users.email, role: users.role, tenantName: tenants.name, tenantSlug: tenants.slug, sessionId: authSessions.id })
+  const [row] = await db.select({ userId: users.id, tenantId: users.tenantId, name: users.name, email: users.email, role: users.role, emailVerifiedAt: users.emailVerifiedAt, tenantName: tenants.name, tenantSlug: tenants.slug, sessionId: authSessions.id })
     .from(authSessions)
     .innerJoin(users, eq(authSessions.userId, users.id))
     .innerJoin(tenants, eq(users.tenantId, tenants.id))
     .where(and(eq(authSessions.tokenHash, hashToken(token)), gt(authSessions.expiresAt, new Date())))
     .limit(1);
   if (!row || !row.email) return null;
-  return { userId: row.userId, tenantId: row.tenantId, name: row.name, email: row.email, role: row.role, tenantName: row.tenantName, tenantSlug: row.tenantSlug };
+  return { userId: row.userId, tenantId: row.tenantId, name: row.name, email: row.email, role: row.role, tenantName: row.tenantName, tenantSlug: row.tenantSlug, emailVerified: Boolean(row.emailVerifiedAt) };
 }
+
+/**
+ * Expired sessions are swept by `purgeExpiredSessions`, and a password reset
+ * invalidates them all via `destroyAllSessions` -- both live in `./maintenance`,
+ * which this module cannot host because `server-only` makes it unimportable
+ * from scripts and scheduled jobs.
+ */
 
 export async function destroyCurrentSession(): Promise<void> {
   const cookieStore = await cookies();

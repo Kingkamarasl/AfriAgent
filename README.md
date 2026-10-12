@@ -201,6 +201,34 @@ records who is waiting, what they asked, and why the assistant stopped.
 Claiming is atomic: two staff clicking at once produce one winner and one clear
 error, not two people chasing the same customer.
 
+## Account recovery and abuse protection
+
+| Gap | How it works |
+| --- | --- |
+| **Login throttling** | Two independent counters — per email and per IP — because either alone is routed around. Rotating IP does not help an attacker targeting one account; spraying accounts from one host does not help them either. Checked *before* any PBKDF2 work, so a throttled attempt costs one indexed count rather than 310k iterations. A success clears the counters, so a few fumbled attempts never leave someone one typo from a lockout. |
+| **Password reset** | `/forgot-password` always returns the same message; saying "no account with that address" would make it an enumeration oracle. Reset links live one hour and work once. |
+| **Email verification** | A banner, not a gate. Blocking sign-in until someone clicks a link in their email is how a shop owner gets locked out of their own dashboard. |
+
+Recovery requires a **confirmed** mailbox. Without that, anyone could register
+with someone else's address and reset their way in — which is what
+verification is for.
+
+**A password reset kills every session for that account.** A stolen cookie must
+not outlive the password it was issued against; otherwise "I reset my password
+because I think someone is in my account" changes nothing.
+
+Tokens are stored as SHA-256 hashes, never in the clear, so a database leak
+yields no working links. Issuing a new link invalidates the previous one, so a
+forwarded email stops working.
+
+### Email is not wired up
+
+`src/lib/email.ts` is a seam with one honest implementation: in development
+messages are logged with their links; in production the provider is explicitly
+unconfigured and **every send is reported as not dispatched**. A dropped
+verification email is a locked-out shop, so a silent no-op was not an option.
+Implement `EmailProvider` to add Resend, Postmark, SES or similar.
+
 ## Scripts
 
 | Command | Purpose |
@@ -310,6 +338,11 @@ exercising code paths:
   what they asked; a retried task does not queue them twice
 - one business cannot edit, publish or delete another business's facts
 - a new fact is invisible to the assistant until it is published
+- **login throttling locks the identity out, and rotating IP or account does
+  not defeat it**; a success clears the counter
+- a reset token cannot be used for verification, or vice versa; a used token
+  says so; an expired one is refused; a new link kills the old
+- **a password reset kills every existing session**
 - every transition lands in the audit log
 
 ## Connecting real WhatsApp

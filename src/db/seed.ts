@@ -122,6 +122,9 @@ export async function seed() {
       // demo has no way to be signed into and its sample data is invisible.
       email: DEMO_EMAIL,
       passwordHash: await hashPassword(DEMO_PASSWORD),
+      // Pre-verified: password recovery is gated on a confirmed mailbox, so
+      // without this the demo account could never reset its password.
+      emailVerifiedAt: new Date(),
       role: "owner",
     })
     .returning();

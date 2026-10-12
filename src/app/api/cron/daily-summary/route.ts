@@ -1,5 +1,7 @@
 import { runDailySummaries } from "@/domain/scheduler";
 import { purgeExpiredSessions } from "@/lib/auth/maintenance";
+import { purgeLoginAttempts } from "@/lib/auth/rate-limit";
+import { purgeAuthTokens } from "@/lib/auth/tokens";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -37,14 +39,20 @@ export async function GET(request: Request) {
   }
 
   const results = await runDailySummaries();
-  const purgedSessions = await purgeExpiredSessions();
+
+  // Housekeeping, in one place rather than a growing list of cron jobs.
+  const [purgedSessions, purgedAttempts, purgedTokens] = await Promise.all([
+    purgeExpiredSessions(),
+    purgeLoginAttempts(),
+    purgeAuthTokens(),
+  ]);
 
   return Response.json({
     ok: true,
     ran: results.filter((r) => r.status === "ran").length,
     skipped: results.filter((r) => r.status === "skipped").length,
     failed: results.filter((r) => r.status === "failed").length,
-    purgedSessions,
+    purged: { sessions: purgedSessions, loginAttempts: purgedAttempts, authTokens: purgedTokens },
     results,
   });
 }

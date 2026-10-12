@@ -284,6 +284,8 @@ export const users = pgTable(
     email: text("email"),
     passwordHash: text("password_hash"),
     role: userRole("role").notNull().default("staff"),
+    /** NULL until the address is proven. Blocks password reset until then. */
+    emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index("users_tenant_idx").on(t.tenantId), uniqueIndex("users_email_unique_idx").on(t.email)],
@@ -430,6 +432,60 @@ export const orderItems = pgTable(
     unitPriceMinor: integer("unit_price_minor").notNull().default(0),
   },
   (t) => [index("order_items_order_idx").on(t.orderId)],
+);
+
+export const authTokenPurpose = pgEnum("auth_token_purpose", [
+  "verify_email",
+  "password_reset",
+]);
+
+/**
+ * Single-use tokens for email verification and password recovery.
+ *
+ * Only the SHA-256 hash is stored, exactly as with sessions: a database leak
+ * must not hand an attacker working reset links. `consumedAt` makes them
+ * single-use even if the same link is followed twice.
+ */
+export const authTokens = pgTable(
+  "auth_tokens",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    purpose: authTokenPurpose("purpose").notNull(),
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("auth_tokens_hash_idx").on(t.tokenHash),
+    index("auth_tokens_user_idx").on(t.userId, t.purpose),
+    index("auth_tokens_expiry_idx").on(t.expiresAt),
+  ],
+);
+
+/**
+ * Login attempts, for brute-force protection.
+ *
+ * The identifier is a SHA-256 hash of the email or IP, never the value
+ * itself. Storing raw addresses here would turn a throttling table into a
+ * list of every address probed against the system.
+ */
+export const loginAttempts = pgTable(
+  "login_attempts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    /** "email:<hash>" or "ip:<hash>". */
+    identifier: text("identifier").notNull(),
+    succeeded: boolean("succeeded").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("login_attempts_lookup_idx").on(t.identifier, t.createdAt),
+    index("login_attempts_expiry_idx").on(t.createdAt),
+  ],
 );
 
 /* ------------------------------------------------------------------ */
@@ -667,6 +723,7 @@ export type TaskEvent = typeof taskEvents.$inferSelect;
 export type UsageLedgerEntry = typeof usageLedger.$inferSelect;
 export type User = typeof users.$inferSelect;
 export type WhatsappLink = typeof whatsappLinks.$inferSelect;
+export type AuthTokenPurpose = (typeof authTokenPurpose.enumValues)[number];
 export type FactTopic = (typeof factTopic.enumValues)[number];
 export type FactTier = (typeof factTier.enumValues)[number];
 export type FactStatus = (typeof factStatus.enumValues)[number];
