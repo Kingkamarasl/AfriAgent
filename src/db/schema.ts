@@ -292,8 +292,52 @@ export const users = pgTable(
 );
 
 /**
- * A shop's WhatsApp Business number. In production the access token lives in a
- * secrets vault keyed by this row -- never returned from an API route.
+ * Who supplied the number.
+ *
+ * Deliberately a *column*, not a branch in the code. The two models stayed
+ * undecided long enough that forking on them would have meant rewriting
+ * onboarding twice, so both fit here and the decision becomes a per-tenant
+ * setting.
+ *
+ *   self_provisioned     the shop connected its own number (Embedded Signup)
+ *   platform_provisioned AfriAgent supplied the number; the shop uses ours
+ *
+ * Both keep `phoneNumberId -> tenant` resolution intact, because either way a
+ * tenant ends up with its own distinct number.
+ */
+export const linkMode = pgEnum("link_mode", [
+  "self_provisioned",
+  "platform_provisioned",
+]);
+
+/**
+ * Connection lifecycle.
+ *
+ * `awaiting_review` is the state that surprises people: numbers and
+ * credentials can be ready while Meta is still reviewing the display name and
+ * the shop cannot receive anything. Modelling it explicitly stops it looking
+ * like a bug mid-onboarding.
+ */
+export const linkStatus = pgEnum("link_status", [
+  /** Row created, nothing configured yet. */
+  "pending",
+  /** Numbers and credentials in place, display name not yet approved. */
+  "awaiting_review",
+  "active",
+  /** Meta restricted the account, or the shop churned. */
+  "suspended",
+  "failed",
+]);
+
+/**
+ * A WhatsApp Business Account connected to a tenant.
+ *
+ * Deliberately does *not* hold an access token yet. A single env-var token
+ * cannot serve two shops -- Graph API tokens are scoped to the WABAs they were
+ * issued for -- so per-tenant credential storage is genuinely unavoidable, but
+ * where it should live (encrypted column vs. secrets manager) depends on the
+ * BSP, and a half-built column that is always NULL is worse than none: it looks
+ * like the problem is solved. That gets built with the provisioning flow.
  */
 export const whatsappLinks = pgTable(
   "whatsapp_links",
@@ -302,16 +346,33 @@ export const whatsappLinks = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
+    mode: linkMode("mode").notNull().default("self_provisioned"),
+    status: linkStatus("status").notNull().default("pending"),
+
     wabaId: text("waba_id"),
     phoneNumberId: text("phone_number_id"),
     businessPhone: text("business_phone").notNull(),
     displayName: text("display_name"),
-    /** Simulated links never hit Meta. Guards the "did you forget creds" path. */
+
+    /** Meta's own state for the display name review. */
+    displayNameStatus: text("display_name_status"),
+    /** Last failure from Meta, shown to whoever is onboarding. */
+    lastError: text("last_error"),
+
     isSimulated: boolean("is_simulated").notNull().default(true),
     isActive: boolean("is_active").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index("whatsapp_links_tenant_idx").on(t.tenantId)],
+  (t) => [
+    index("whatsapp_links_tenant_idx").on(t.tenantId),
+    // Inbound resolution looks a number up on every webhook, so this index
+    // matters more than any other on the table.
+    //
+    // Nullable, so many not-yet-connected shops can each hold a NULL. Postgres
+    // permits that under a unique index. Once set, this is what guarantees one
+    // number resolves to exactly one tenant.
+    uniqueIndex("whatsapp_links_phone_number_idx").on(t.phoneNumberId),
+  ],
 );
 
 /** Opaque, hashed session tokens. Raw tokens are only held in HttpOnly cookies. */

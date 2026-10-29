@@ -1,0 +1,60 @@
+name: CI
+
+# Runs on every push and PR. Fast enough to run on every save, which is the
+# point: the checks only catch drift if they actually run.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # No env file. The app is built to run with nothing configured: PGlite in
+      # process, the WhatsApp simulator, and the console email provider. If a
+      # check only passes with secrets present, it is not proving much.
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # Migrations run out of process by design -- see src/db/migrate.ts.
+      - name: Migrate
+        run: npm run db:migrate
+
+      - name: Seed
+        run: npm run db:seed
+
+      # The suite asserts product guarantees and must stay re-runnable, so this
+      # runs twice: the second run is what proves it does not depend on the
+      # state the first one left behind.
+      - name: Smoke
+        run: npm run smoke
+
+      - name: Smoke (re-run, must not depend on prior state)
+        run: npm run smoke
+
+      - name: Build
+        run: npm run build
+        env:
+          # PGlite must not be instantiated at module scope or the build aborts.
+          NEXT_TELEMETRY_DISABLED: "1"

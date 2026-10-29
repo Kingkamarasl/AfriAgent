@@ -127,6 +127,14 @@ const ALIASES: Record<string, string[]> = {
   amount: ["amount", "total", "value", "amount_due", "balance"],
   issued_on: ["issued_on", "issued", "date", "invoice_date", "date_issued"],
   due_on: ["due_on", "due", "due_date", "payment_due"],
+  // Orders. `sku`/`amount` are reused from above because a POS export names
+  // them the same way -- an order total really is an `amount`, and a line item
+  // really is a `sku`.
+  order_ref: ["order_ref", "order", "order_number", "order_no", "ref_no", "reference"],
+  placed_on: ["placed_on", "placed", "order_date", "sold_at", "date", "created_at"],
+  line_qty: ["line_qty", "qty", "quantity", "units"],
+  line_price: ["line_price", "price", "unit_price"],
+  status: ["status", "order_status", "state"],
 };
 
 export function pick(record: Record<string, string>, field: keyof typeof ALIASES): string {

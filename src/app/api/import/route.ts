@@ -1,5 +1,5 @@
 import { requireManagerActor } from "@/app/actions";
-import { currentTotals, importCsv } from "@/domain/import";
+import { currentTotals, importCsv, type ImportKind } from "@/domain/import";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,8 +16,8 @@ export const dynamic = "force-dynamic";
  *
  * Body is the raw CSV text, `text/csv`:
  *
- *   curl -X POST "http://localhost:3000/api/import?kind=products" \
- *     -H "content-type: text/csv" --data-binary @catalogue.csv
+ *   curl -X POST "http://localhost:3000/api/import?kind=orders" \
+ *     -H "content-type: text/csv" --data-binary @sales.csv
  */
 export async function POST(request: Request) {
   let tenantId: string;
@@ -34,9 +34,10 @@ export async function POST(request: Request) {
   const kindParam = url.searchParams.get("kind") ?? "products";
   const commit = url.searchParams.get("commit") === "1";
 
-  if (kindParam !== "products" && kindParam !== "invoices") {
+  const KINDS = ["products", "invoices", "orders"] as const;
+  if (!(KINDS as readonly string[]).includes(kindParam)) {
     return Response.json(
-      { error: `Unknown kind "${kindParam}". Use "products" or "invoices".` },
+      { error: `Unknown kind "${kindParam}". Use one of: ${KINDS.join(", ")}.` },
       { status: 400 },
     );
   }
@@ -46,7 +47,7 @@ export async function POST(request: Request) {
     return Response.json({ error: "Empty body" }, { status: 400 });
   }
 
-  const result = await importCsv(tenantId, csv, kindParam, { dryRun: !commit });
+  const result = await importCsv(tenantId, csv, kindParam as ImportKind, { dryRun: !commit });
   const totals = await currentTotals(tenantId);
 
   return Response.json({

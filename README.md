@@ -40,13 +40,20 @@ inbound WhatsApp message
 
 This repository is still a pre-launch prototype, not ready for public production use.
 It now includes email/password registration and login, PBKDF2 password hashing,
-opaque database-backed sessions in HttpOnly cookies, and dashboard tenant
-resolution from the verified session. Email verification, password reset,
-login rate limiting, team invitations/role management, durable webhook processing,
-provider-backed AI, billing reconciliation, and production operations are still
-required before public launch. WhatsApp webhook requests are rejected unless
-`WHATSAPP_APP_SECRET` is set. Run typecheck, lint, smoke tests, and a production
-build in a clean environment before deployment.
+opaque database-backed sessions in HttpOnly cookies, dashboard tenant
+resolution from the verified session, email verification, password reset,
+login rate limiting, a Resend email provider, a knowledge base, a handoff queue,
+and a WhatsApp connection lifecycle that supports both numbering models.
+Team invitations/role management, durable webhook processing, per-tenant
+WhatsApp credentials, provider-backed AI, billing reconciliation, and production
+operations are still required before public launch. WhatsApp webhook requests
+are rejected unless `WHATSAPP_APP_SECRET` is set. Run typecheck, lint, smoke
+tests, and a production build in a clean environment before deployment.
+
+> **Turbopack builds may fail on Windows** with `failed to create junction point
+> … Access is denied`. That is the OS refusing symlink creation, not a code
+> fault — `npx next build --webpack` is the workaround, and a reboot often
+> clears it.
 
 ## Quick start
 
@@ -168,6 +175,45 @@ still metered per completed task. This exists so the billable weights can be
 set from measured numbers during the pilot rather than guessed. A per-tenant
 daily budget stops the spending before it happens.
 
+NVIDIA's free tier is **trial only** — prototyping and testing. Production use
+requires an NVIDIA AI Enterprise licence (~US$4,500/GPU/year, or ~US$1/GPU-hour).
+That is a commercial dependency worth pricing before building further on it.
+
+### Checking the provider is actually wired
+
+`npm run ai:check` runs the adapter against the live endpoint and reports what is
+true rather than what the docs say should be true. It needs no database.
+
+It establishes, in order: the key is accepted, the configured model exists,
+**the model emits a real tool call**, which thinking kwarg the run actually used,
+and that the real production tool set is accepted.
+
+The third step is the one that matters. Grounding depends entirely on the model
+calling tools, and a wrong `AI_THINKING_PARAM` fails *silently* — the model still
+answers, it just stops calling tools, so prices come back from prose instead of
+from the database. Nothing looks broken except correctness. The check names that
+failure explicitly and says what to change.
+
+## Platform settings
+
+`/admin/platform` holds the AI credentials. It is **global, not per shop**: the
+key authenticates every message the assistant answers, for every tenant.
+
+- **Secrets are encrypted at rest** (AES-256-GCM) so the key is not sitting in
+  plaintext in every backup and `SELECT *`. `PLATFORM_SECRETS_KEY` must stay in
+  the environment — a key that encrypts keys cannot be stored beside the things
+  it protects.
+- **Nothing ever returns a secret to a browser.** The page shows only the last
+  four characters, and no action's return value carries the key.
+- **Env vars are a bootstrap path, not the source of truth.** A saved key wins,
+  so an admin can rotate without a redeploy.
+- **Access is an allowlist**, `PLATFORM_ADMIN_EMAILS`. There is no platform role
+  in the user model because `owner | manager | staff` are all tenant-scoped; a
+  platform-wide role would let a tenant owner be granted reach over credentials
+  that spend the company's money. Empty list means nobody — it fails closed.
+- The page is **not in the app navigation**. A tenant owner is redirected away
+  and never learns it exists.
+
 ## Knowledge base
 
 `/knowledge` is where a business tells its assistant what is true. Without it
@@ -221,13 +267,19 @@ Tokens are stored as SHA-256 hashes, never in the clear, so a database leak
 yields no working links. Issuing a new link invalidates the previous one, so a
 forwarded email stops working.
 
-### Email is not wired up
+### Email
 
-`src/lib/email.ts` is a seam with one honest implementation: in development
-messages are logged with their links; in production the provider is explicitly
-unconfigured and **every send is reported as not dispatched**. A dropped
-verification email is a locked-out shop, so a silent no-op was not an option.
-Implement `EmailProvider` to add Resend, Postmark, SES or similar.
+Resend is wired up (`EMAIL_PROVIDER=resend`, `RESEND_API_KEY`, `EMAIL_FROM`),
+but it is **not** the default — sending real mail should never happen by
+accident. Unset, development logs to the console and production refuses to send.
+
+Both email callers check the dispatch result and log loudly on failure. That
+matters more than it looks: a dropped reset email leaves a token in the
+database, shows the owner "check your email", and locks them out with no visible
+cause. `dispatched: true` means the provider *accepted* the message, not that it
+arrived.
+
+`APP_URL` must be set in production or the links point at localhost.
 
 ## Scripts
 
@@ -237,6 +289,7 @@ Implement `EmailProvider` to add Resend, Postmark, SES or similar.
 | `npm run build` | Production build |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run smoke` | Asserts the product guarantees (see below) |
+| `npm run ai:check` | Live NVIDIA connection + tool-calling check |
 | `npm run db:seed` | Seed the demo shop (idempotent) |
 | `npm run db:migrate` | Apply migrations (separate process — see below) |
 | `npm run db:generate` | Generate migrations from the schema |
@@ -250,12 +303,35 @@ import is the onboarding path, and it is deliberately two-step:
 ```
 POST /api/import?kind=products            -> validate only, writes nothing
 POST /api/import?kind=products&commit=1   -> write
+POST /api/import?kind=invoices&commit=1
+POST /api/import?kind=orders&commit=1
 ```
 
 Or use the panel on the dashboard. Sample files are in `samples/`.
 
 Products accept `sku, name, unit, stock, reorder_level, unit_price`. Invoices
-accept `number, customer_name, wa_id, amount, issued_on, due_on`.
+accept `number, customer_name, wa_id, amount, issued_on, due_on`. Orders accept
+`order_ref, placed_on, amount, status` plus optional line columns `sku, qty,
+price, name`.
+
+**Orders are not optional decoration.** `sales_report` is computed from
+`orders.totalMinor`, so a shop that imports products and invoices but no orders
+gets a confidently empty revenue figure — worse than an error, because it looks
+like a quiet week rather than missing data.
+
+Two export shapes are accepted, because POS systems differ:
+
+```
+long (one row per line item, reference repeated)     wide (one row per order)
+order_ref,placed_on,sku,qty,price                    order_ref,placed_on,amount,status
+ORD-9100,2026-10-03,SUG-1KG,2,1450                   ORD-9001,2026-10-01,12500,paid
+ORD-9100,2026-10-03,BLUE-N,1,5900
+```
+
+Rows are grouped on the reference, so a long export is not mistaken for
+duplicate orders. If the file supplies a total it is used verbatim; otherwise it
+is derived from the line items, because the report reads `totalMinor` and a zero
+would understate revenue to nothing.
 
 Behaviour worth knowing:
 
@@ -265,11 +341,31 @@ Behaviour worth knowing:
   it US-style silently produces due dates that are eight months wrong.
 - **Phone numbers are normalised.** `+234 802 000 0002` matches a stored
   `2348020000002`, so you can re-import a corrected file without duplicating.
-- **Re-importing is an upsert.** Matched on SKU / invoice number.
+- **Re-importing is an upsert.** Matched on SKU / invoice number / order
+  reference. Re-importing an order replaces its line items rather than merging
+  them, so repeated exports do not accumulate duplicates.
+- **Order status matters for revenue.** `sales_report` excludes `cancelled`, so
+  a voided order must import as `cancelled` or it inflates the number a shop is
+  shown. `paid` / `delivered` / `complete` map to `fulfilled`; an unrecognised
+  status is an error, not a guess.
+- **Undated history is imported as today**, with a warning. Blocking it would
+  mean refusing the whole file; silently doing it would flatter the report.
 - **Structural errors block the whole import.** Nothing lands. Warnings (a
-  missing price, an invoice with no WhatsApp number) do not block — those are
-  the owner's judgement call. An invoice with no `wa_id` is still recorded, and
-  the warning says it cannot be chased.
+  missing price, an invoice with no `wa_id`) do not block — those are the
+  owner's judgement call. An invoice with no `wa_id` is still recorded, and the
+  warning says it cannot be chased.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs typecheck, lint, migrate, seed, smoke (twice)
+and build on every push. Two deliberate choices:
+
+- **No secrets.** PGlite, the simulator and the console email provider mean the
+  app runs with nothing configured. A check that only passes with credentials
+  present is not proving much.
+- **Smoke runs twice.** The second run is what proves the suite does not depend
+  on state the first one left behind — a property worth testing rather than
+  assuming.
 
 ## Billing model
 
@@ -369,6 +465,41 @@ WHATSAPP_VERIFY_TOKEN=    # the token you choose when registering the webhook
 Point Meta at `POST /api/webhooks/whatsapp` and subscribe to the `messages`
 field.
 
+### Number ownership: decided per tenant, not in code
+
+Whether a shop brings its own number or AfriAgent provisions one is still an
+open product decision, so it is a column rather than a code fork:
+
+| `mode` | Meaning |
+| --- | --- |
+| `self_provisioned` | The shop connected its own number via Embedded Signup |
+| `platform_provisioned` | AfriAgent supplied the number |
+
+Both keep `phone_number_id → tenant` resolution intact, because either way a
+tenant ends up with its own distinct number. Choosing wrong later is a data
+change, not a rewrite.
+
+Each link also moves through a lifecycle:
+
+```
+pending ──▶ awaiting_review ──▶ active
+   │              │
+   └──────────────┴──▶ failed
+   └──▶ suspended        (Meta restricted the account, or the shop churned)
+```
+
+`awaiting_review` is the state worth naming explicitly: the number can be bound
+and everything configured while Meta is still reviewing the display name, and
+the shop cannot yet be messaged. Without it that reads as a bug mid-onboarding.
+Only `active` links may send.
+
+What is deliberately **not** here yet: per-tenant access tokens. A single
+env-var token cannot serve two shops — Graph API tokens are scoped to the WABAs
+they were issued for — so credential storage is genuinely unavoidable. Where it
+lives (encrypted column vs. secrets manager) depends on the BSP, and an
+always-`NULL` column would only make the problem look solved. It gets built with
+the provisioning flow.
+
 ### Two rules the code enforces for you
 
 **1. The 24-hour customer service window.** Free-form replies are only legal
@@ -434,44 +565,53 @@ same task forward and double-send a message to a customer.
 **Real:** task engine and metering, approval gate, audit log, timezone-correct
 reporting, WhatsApp Cloud API integration, webhook signature verification,
 idempotent delivery, tenant scoping, PGlite/Postgres parity, CSV import with
-validation, scheduled daily summary.
+validation, scheduled daily summary, full account lifecycle (registration,
+login, logout, email verification, password reset, login throttling), a
+transactional email provider, a two-tier knowledge base with retrieval, a human
+handoff queue, an AI layer (tool calling + grounding) behind a provider seam, a
+WhatsApp connection lifecycle that supports both numbering models, and a
+platform-admin surface for AI credentials.
 
 **Stubbed / not built yet:**
 
-- **Auth.** Email/password login and database-backed sessions are implemented,
-  but email verification, password reset, login throttling, MFA, and team
-  membership management remain launch blockers. The simulator derives its
-  tenant from the authenticated session, not request data.
-- **Intent routing is regex, not an LLM.** Deliberately: every branch is
-  testable and behaviour is identical with or without an API key. To swap in a
-  model, replace the body of `routeMessage` with a tool-call loop returning the
-  same `PlannedTask[]`. Nothing downstream changes.
-- **No knowledge base.** `customer_question` and `appointment_book` have task
-  kinds and states but no executor yet.
-- **No durable queue.** Tasks execute inline in the webhook. Real deployments
-  need Inngest or Trigger.dev so a slow report never delays Meta's ack.
-- **Order import.** Products and invoices only; the CSV importer does not yet
-  read historical sales, which is what `sales_report` reads from.
-- **Rate card is a starting point.** Tune against real LLM + WhatsApp costs
-  before quoting anyone.
+- **No leads table.** Nothing captures a customer who asks something the shop
+  should follow up on.
+- **No durable queue.** Tasks execute inline in the webhook, so a slow report can
+  delay Meta's acknowledgement. Real deployments need Inngest or Trigger.dev.
+- **No per-tenant WhatsApp credentials.** A single env-var token cannot serve two
+  shops; required before onboarding shop number two.
+- **Intent routing is regex, not an LLM.** Deliberate: every branch is testable
+  and behaviour is identical with or without an API key.
+- **No MFA or team invitations.** One owner per shop; no invitation flow.
 - **No payments collection.** v1 chases invoices and sends a payment link; it
   does not take money. Mobile-money integration is deliberately out of scope.
+- **Rate card is a starting point.** Tune against real LLM + WhatsApp costs
+  before quoting anyone.
+- **No CI.** Typecheck, lint, smoke and build are run by hand.
 
 ## Suggested next steps
 
-1. **Real auth + tenancy guards** — from last time; still the biggest risk.
-2. **Decide the WhatsApp number question** — per-shop numbers or one shared
-   number? It changes the schema, the onboarding flow and the compliance story.
-3. **Order/sales import** — completes the data picture so the sales report
-   works on day one rather than day thirty.
-4. **Graduated autonomy** — auto-send low-risk categories, escalate on novelty
-   or value thresholds, let the shop tune it.
-5. **Durable queue** — move `processTask` into Inngest.
-6. **Knowledge base** — document ingestion + retrieval for `customer_question`.
+1. **Per-tenant WhatsApp credentials.** Unblocked, ~2 hours, and required before
+   a second shop can exist.
+2. **Meta business verification.** Unblocked and slow — needs a domain, a domain
+   email, and incorporation documents. The long pole for any real WhatsApp
+   number, and it ages badly if deferred.
+3. **Decide the WhatsApp numbering model.** Blocked on BSP answers (draft is in
+   `BSP_OUTREACH_EMAIL.md`). The schema supports both, so this is a
+   product/compliance call, not an engineering one.
+4. **Appointments and lead capture** — the two things a shop asks for first that
+   currently escalate to a human. Neither has a table.
+5. **Durable queue** — move `processTask` into Inngest so a slow report never
+   delays Meta's ack.
 
 ## Compliance notes
 
 - Meta prohibits unofficial WhatsApp APIs. This uses the official Cloud API only.
+- **Automation requires escalation paths.** Meta's Business Messaging Policy
+  requires a prompt, direct route to a human whenever automated replies are in
+  use. The handoff queue covers in-chat transfer; the policy also contemplates
+  phone, email and web support, so a published phone number and email are a
+  compliance item, not just a nicety.
 - **POPIA** (ZA), **NDPA** (NG/KE) and friends: keep African customer PII in a
   in-region database (Neon AWS eu-west-1 / Supabase EU are common choices).
 - Conversations contain customer PII. Retention and deletion policies are not

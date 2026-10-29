@@ -22,6 +22,7 @@ import {
   tenants,
   usageLedger,
   users,
+  whatsappLinks,
 } from "../src/db/schema";
 import { sendTask, handleInboundMessage } from "../src/domain/pipeline";
 import {
@@ -35,7 +36,8 @@ import {
   transitionTask,
 } from "../src/domain/task-service";
 import { IncoherentRateCardError, InvalidTransitionError, DEFAULT_RATE_CARD, assertRateCardCoherent, requiresApprovalFor } from "../src/domain/tasks";
-import { importCsv, parseDate } from "../src/domain/import";
+import { currentTotals, importCsv, parseDate } from "../src/domain/import";
+import { orders, orderItems } from "../src/db/schema";
 import { runDailySummaries } from "../src/domain/scheduler";
 import { parseCsv } from "../src/lib/csv";
 import { verifyPassword, verifyPasswordWithFallback } from "../src/lib/auth/password";
@@ -71,6 +73,29 @@ import {
   isEmailVerified,
 } from "../src/lib/auth/tokens";
 import { destroyAllSessions } from "../src/lib/auth/maintenance";
+import { randomBytes } from "node:crypto";
+import { encryptSecret, decryptSecret } from "../src/lib/platform/secrets";
+import { isPlatformAdminEmail } from "../src/lib/platform/admin";
+import {
+  clearPlatformSecret,
+  describePlatformSecret,
+  getPlatformSecret,
+  getPlatformSetting,
+  invalidatePlatformSettings,
+  setPlatformSecret,
+  setPlatformSetting,
+} from "../src/domain/platform-settings";
+import { resolveProvider } from "../src/ai/index";
+import { platformSettings } from "../src/db/schema";
+import { getEmailProvider, passwordResetEmail, sendEmail, verificationEmail } from "../src/lib/email";
+import {
+  canSend,
+  canTransitionLink,
+  createLink,
+  getLinkForPhoneNumber,
+  recordNumberBound,
+  setLinkStatus,
+} from "../src/lib/whatsapp/links";
 
 let passed = 0;
 let failed = 0;
@@ -1152,8 +1177,475 @@ async function main() {
     `${beforeReset} -> ${afterReset}`,
   );
 
-  await db.delete(authTokens);
+await db.delete(authTokens);
 
+  /* ---------------------------------------------------------------- */
+  /* WhatsApp link lifecycle                                           */
+  /* ---------------------------------------------------------------- */
+
+  console.log("\nWhatsApp connection lifecycle");
+
+  // The point of the lifecycle is that the numbering model stays a per-tenant
+  // setting rather than a code fork, so both modes must be expressible.
+  check("pending -> awaiting_review is legal", canTransitionLink("pending", "awaiting_review"));
+  check(
+    "pending cannot jump straight to active",
+    !canTransitionLink("pending", "active"),
+    "skips the review gate",
+  );
+  check("active can be suspended", canTransitionLink("active", "suspended"));
+  check("suspension is recoverable", canTransitionLink("suspended", "active"));
+  check("a state is not a legal transition to itself", !canTransitionLink("active", "active"));
+  check("an unknown source state is rejected", !canTransitionLink("bogus" as never, "active"));
+
+  // A link that exists but has no approved display name must not be sendable.
+  // This is the "connected but unreachable" state that otherwise reads as a bug.
+  check(
+    "a link awaiting display-name review cannot send",
+    !canSend({ status: "awaiting_review", isActive: true } as never),
+  );
+  check("a suspended link cannot send", !canSend({ status: "suspended", isActive: true } as never));
+  check("an active link can send", canSend({ status: "active", isActive: true } as never));
+  // Simulated is a transport choice, not a broken connection: the seeded demo
+  // shop is simulated and must still count as sendable.
+  check(
+    "a simulated but active link can still send",
+    canSend({ status: "active", isActive: true, isSimulated: true } as never),
+  );
+
+  const link = await createLink({
+    tenantId: tenant.id,
+    businessPhone: "+2348000009999",
+    mode: "platform_provisioned",
+    isSimulated: true,
+  });
+  check("a new link starts pending", link.status === "pending", link.status);
+  check("the numbering model is stored per link", link.mode === "platform_provisioned");
+
+  const bound = await recordNumberBound({
+    linkId: link.id,
+    wabaId: "TEST-WABA",
+    phoneNumberId: "TEST_PNID_SMOKE",
+    displayName: "Smoke Test Shop",
+  });
+  check(
+    "binding a number without display-name approval lands in awaiting_review",
+    bound.status === "awaiting_review",
+    bound.status,
+  );
+
+  const found = await getLinkForPhoneNumber("TEST_PNID_SMOKE");
+  check("an inbound phone number resolves to its link", found?.id === link.id);
+
+  const activated = await setLinkStatus(link.id, "active", { reason: "display name approved" });
+  check("awaiting_review -> active", activated.status === "active");
+  check("the reason is retained for whoever is onboarding", activated.lastError === "display name approved");
+
+  const suspended = await setLinkStatus(link.id, "suspended", { reason: "Meta restriction" });
+  check("active -> suspended", suspended.status === "suspended");
+  check("a suspended link stops sending", !canSend(suspended));
+
+  let rejected = false;
+  try {
+    await setLinkStatus(link.id, "pending");
+  } catch {
+    rejected = true;
+  }
+  check("an illegal transition is refused, not silently applied", rejected);
+
+  // Idempotent, so a replayed webhook cannot throw or corrupt state.
+  const sameAgain = await setLinkStatus(link.id, "suspended");
+  check("re-applying the same status is a no-op", sameAgain.status === "suspended");
+
+  await db.delete(whatsappLinks).where(eq(whatsappLinks.id, link.id));
+
+/* ---------------------------------------------------------------- */
+  /* Email provider                                                    */
+  /* ---------------------------------------------------------------- */
+
+  console.log("\nEmail provider");
+
+  const realFetch = globalThis.fetch;
+  const savedEnv = {
+    provider: process.env.EMAIL_PROVIDER,
+    key: process.env.RESEND_API_KEY,
+    from: process.env.EMAIL_FROM,
+  };
+
+  /** Replies with a canned Resend response and records what was sent. */
+  function stubResend(status: number, body: unknown) {
+    const seen: { auth?: string; payload?: Record<string, unknown> } = {};
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      seen.auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+      seen.payload = JSON.parse(String(init?.body ?? "{}"));
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        json: async () => body,
+      } as Response;
+    }) as typeof fetch;
+    return seen;
+  }
+
+  process.env.EMAIL_PROVIDER = "resend";
+  process.env.RESEND_API_KEY = "re_test_key";
+  process.env.EMAIL_FROM = "AfriAgent <no-reply@afriagent.test>";
+
+  const testMessage = { to: "owner@ojota.local", subject: "Reset", text: "link" };
+
+  const okSeen = stubResend(200, { id: "resend-abc123" });
+  const ok = await sendEmail(testMessage);
+  check("a 2xx with a message id counts as dispatched", ok.dispatched === true);
+  check("the provider returns the message id", ok.detail === "resend-abc123");
+  check(
+    "the API key is sent as a bearer token",
+    okSeen.auth === "Bearer re_test_key",
+    okSeen.auth,
+  );
+  check(
+    "the configured sender is used",
+    okSeen.payload?.from === "AfriAgent <no-reply@afriagent.test>",
+  );
+  check(
+    "the recipient is passed as an array",
+    Array.isArray(okSeen.payload?.to) && (okSeen.payload?.to as string[])[0] === testMessage.to,
+  );
+
+  // The subtle one: Resend answers 200 with an error body for some rejections.
+  // A status-code-only check would report this as sent.
+  stubResend(200, { error: { name: "validation_error", message: "Invalid `to`" } });
+  const rejected200 = await sendEmail(testMessage);
+  check("a 200 that carries an error is NOT dispatched", rejected200.dispatched === false);
+  check(
+    "the provider error is surfaced",
+    (rejected200.detail ?? "").includes("Invalid `to`"),
+    rejected200.detail,
+  );
+
+  stubResend(422, { message: "Unverified domain" });
+  const rejected422 = await sendEmail(testMessage);
+  check("a 422 is NOT dispatched", rejected422.dispatched === false);
+  check(
+    "the failure reason is surfaced",
+    (rejected422.detail ?? "").includes("Unverified domain"),
+    rejected422.detail,
+  );
+
+  stubResend(200, {});
+  const noId = await sendEmail(testMessage);
+  check("a 2xx with no message id is NOT dispatched", noId.dispatched === false);
+
+  // A transport failure must not become a 500 on a password reset form.
+  globalThis.fetch = (async () => {
+    throw new Error("ECONNREFUSED");
+  }) as typeof fetch;
+  let threw = false;
+  const networkFail = await sendEmail(testMessage).catch(() => {
+    threw = true;
+    return { dispatched: true };
+  });
+  check("sendEmail never throws on a network failure", threw === false);
+  check("a network failure is reported as not dispatched", networkFail.dispatched === false);
+
+  // Misconfiguration must not fall back to the console logger and look like
+  // it worked.
+  delete process.env.RESEND_API_KEY;
+  check(
+    "EMAIL_PROVIDER=resend without a key falls back to unconfigured",
+    getEmailProvider().name === "unconfigured",
+  );
+  process.env.RESEND_API_KEY = "re_test_key";
+  delete process.env.EMAIL_FROM;
+  check(
+    "EMAIL_PROVIDER=resend without a sender falls back to unconfigured",
+    getEmailProvider().name === "unconfigured",
+  );
+  process.env.EMAIL_FROM = "AfriAgent <no-reply@afriagent.test>";
+  check("a fully configured resend provider is selected", getEmailProvider().name === "resend");
+
+  globalThis.fetch = realFetch;
+  for (const [k, v] of [
+    ["EMAIL_PROVIDER", savedEnv.provider],
+    ["RESEND_API_KEY", savedEnv.key],
+    ["EMAIL_FROM", savedEnv.from],
+  ] as const) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+
+  // The links these emails carry are the whole point of the email.
+  const vLink = "https://app.test/verify-email?token=tok123";
+  check("the verification email carries its link", verificationEmail("Ojota", vLink).text.includes(vLink));
+  const rLink = "https://app.test/reset-password?token=tok456";
+  check("the reset email carries its link", passwordResetEmail(rLink).text.includes(rLink));
+/* ---------------------------------------------------------------- */
+  /* Platform settings and secrets                                    */
+  /* ---------------------------------------------------------------- */
+
+  console.log("\nPlatform settings and secrets");
+
+  const savedEnvKey = process.env.PLATFORM_SECRETS_KEY;
+  process.env.PLATFORM_SECRETS_KEY = randomBytes(32).toString("base64");
+
+  const SECRET = "nvapi-testkey-0123456789abcdef";
+
+  const sealed = encryptSecret(SECRET);
+  check("a secret does not contain its plaintext", !sealed.includes("nvapi-testkey"));
+  check("ciphertext is versioned", sealed.startsWith("v1."));
+  check("a secret round-trips", decryptSecret(sealed) === SECRET);
+  check("a fresh encrypt produces a different ciphertext", encryptSecret(SECRET) !== sealed);
+
+  // A tampered ciphertext must fail to authenticate rather than return garbage
+  // that would then be sent to NVIDIA as a credential.
+  const parts = sealed.split(".");
+  const tampered = [parts[0], parts[1], parts[2], Buffer.from("nonsense").toString("base64url")].join(".");
+  let tamperRejected = false;
+  try {
+    decryptSecret(tampered);
+  } catch {
+    tamperRejected = true;
+  }
+  check("a tampered secret is rejected, not decoded", tamperRejected);
+
+  let malformedRejected = false;
+  try {
+    decryptSecret("not-a-secret");
+  } catch {
+    malformedRejected = true;
+  }
+  check("a malformed secret is rejected", malformedRejected);
+
+  // A rotated PLATFORM_SECRETS_KEY must not silently return garbage.
+  const rotated = randomBytes(32).toString("base64");
+  process.env.PLATFORM_SECRETS_KEY = rotated;
+  let wrongKeyRejected = false;
+  try {
+    decryptSecret(sealed);
+  } catch {
+    wrongKeyRejected = true;
+  }
+  check("a rotated encryption key fails loudly", wrongKeyRejected);
+  // Restore, or generate a fresh key if there was none set, so the persistence
+  // checks below run against a usable key either way.
+  process.env.PLATFORM_SECRETS_KEY = savedEnvKey ?? randomBytes(32).toString("base64");
+  await setPlatformSecret("nvidia_api_key", SECRET);
+  invalidatePlatformSettings();
+
+  const readBack = await getPlatformSecret("nvidia_api_key");
+  check("a stored secret reads back intact", readBack === SECRET);
+
+  // The raw row must not hold plaintext -- that is the whole point of sealing.
+  const rawRow = await getDb().then((d) =>
+    d.select().from(platformSettings).where(eq(platformSettings.key, "nvidia_api_key")).limit(1),
+  );
+  check(
+    "the stored row does not contain the plaintext key",
+    !JSON.stringify(rawRow[0]?.value ?? {}).includes("nvapi-testkey"),
+  );
+
+  const described = await describePlatformSecret("nvidia_api_key");
+  check("describe reports the secret as set", described.set === true);
+  check(
+    "describe never returns the value",
+    !JSON.stringify(described).includes(SECRET),
+    JSON.stringify(described),
+  );
+  check("describe shows only the last four characters", described.masked?.endsWith("cdef") === true);
+
+  // Precedence: a stored value wins over the environment, which is what makes
+  // rotation possible without a redeploy.
+  const savedApiKey = process.env.NVIDIA_API_KEY;
+  process.env.NVIDIA_API_KEY = "env-bootstrap-key-value";
+  invalidatePlatformSettings();
+  const withStore = await resolveProvider();
+  check("a stored key takes precedence over the environment", !withStore.config.degraded);
+  check("resolution is async but still returns a live provider", withStore.config.provider === "nvidia");
+
+  await clearPlatformSecret("nvidia_api_key");
+  invalidatePlatformSettings();
+  const afterClear = await getPlatformSecret("nvidia_api_key");
+  check("a cleared secret reads as absent rather than throwing", afterClear === null);
+  check(
+    "an absent secret falls back to describe as not set",
+    (await describePlatformSecret("nvidia_api_key")).set === false,
+  );
+
+  // Non-secret settings round-trip as plain values.
+  await setPlatformSetting("ai_model", "nvidia/some-model");
+  invalidatePlatformSettings();
+  check(
+    "a plain setting round-trips",
+    (await getPlatformSetting("ai_model", "fallback")) === "nvidia/some-model",
+  );
+  check(
+    "an unset setting returns the fallback",
+    (await getPlatformSetting("ai_setting_that_does_not_exist", "fallback")) === "fallback",
+  );
+
+  let refusedPlaintextSecret = false;
+  try {
+    await setPlatformSetting("nvidia_api_key", "oops");
+  } catch {
+    refusedPlaintextSecret = true;
+  }
+  check("a secret cannot be written through the plain-settings path", refusedPlaintextSecret);
+
+  let unregisteredRefused = false;
+  try {
+    await setPlatformSecret("some_unregistered_key", "value");
+  } catch {
+    unregisteredRefused = true;
+  }
+  check("only registered keys can hold secrets", unregisteredRefused);
+
+  await setPlatformSetting("ai_model", "");
+  await setPlatformSetting("ai_base_url", "");
+  await setPlatformSetting("ai_thinking_param", "");
+  invalidatePlatformSettings();
+
+  if (savedApiKey === undefined) delete process.env.NVIDIA_API_KEY;
+  else process.env.NVIDIA_API_KEY = savedApiKey;
+
+  /* ---------------------------------------------------------------- */
+  /* Platform admin authorisation                                     */
+  /* ---------------------------------------------------------------- */
+
+  console.log("\nPlatform admin authorisation");
+
+  const savedAdmins = process.env.PLATFORM_ADMIN_EMAILS;
+  process.env.PLATFORM_ADMIN_EMAILS = "ops@example.com, founder@example.com";
+
+  check("a listed email is a platform admin", isPlatformAdminEmail("ops@example.com"));
+  check("matching is case-insensitive", isPlatformAdminEmail("OPS@Example.com"));
+  check("an unlisted email is not", !isPlatformAdminEmail("tenant-owner@example.com"));
+  check("a null email is not", !isPlatformAdminEmail(null));
+  check("an undefined email is not", !isPlatformAdminEmail(undefined));
+
+  // The allowlist must fail closed: an empty or missing list grants nothing,
+  // rather than granting everyone.
+  process.env.PLATFORM_ADMIN_EMAILS = "";
+  check("an empty allowlist grants nobody", !isPlatformAdminEmail("ops@example.com"));
+
+  delete process.env.PLATFORM_ADMIN_EMAILS;
+  check("a missing allowlist grants nobody", !isPlatformAdminEmail("ops@example.com"));
+
+  process.env.PLATFORM_ADMIN_EMAILS = savedAdmins ?? "";
+  if (savedEnvKey === undefined) delete process.env.PLATFORM_SECRETS_KEY;
+  if (savedAdmins === undefined) delete process.env.PLATFORM_ADMIN_EMAILS;
+/* ---------------------------------------------------------------- */
+  /* Order import                                                     */
+  /* ---------------------------------------------------------------- */
+
+  console.log("\nOrder import");
+
+  // The report reads orders.totalMinor, so the total is the part that matters.
+  // A wide export: one row per order, total supplied.
+  const wideCsv = [
+    "order_ref,placed_on,amount,status,sku,qty,price",
+    "ORD-9001,2026-10-01,12500.00,paid,SUG-1KG,2,6250.00",
+    "ORD-9002,01/10/2026,8000,delivered,BLUE-N,1,8000",
+    "ORD-9003,2026-10-02,3000,cancelled,TEA-400,3,1000",
+  ].join("\n");
+
+  const wideDry = await importCsv(tenant.id, wideCsv, "orders", { dryRun: true });
+  check("a dry run writes nothing", wideDry.created === 3 && wideDry.dryRun === true);
+  check("a dry run reports no errors", wideDry.errors.length === 0, JSON.stringify(wideDry.errors));
+  check("day-first dates are accepted", !wideDry.warnings.some((w) => w.includes("Could not read")));
+
+  const wideCommit = await importCsv(tenant.id, wideCsv, "orders", { dryRun: false });
+  check("a committed order import creates rows", wideCommit.created === 3, JSON.stringify(wideCommit));
+
+  const [ord9001] = await db
+    .select()
+    .from(orders)
+    .where(eq(orders.reference, "ORD-9001"));
+  check("the supplied total is used verbatim", ord9001?.totalMinor === 1_250_000, String(ord9001?.totalMinor));
+  check("an imported order is marked as such", ord9001?.source === "import");
+  check("a paid order maps to fulfilled", ord9001?.status === "fulfilled");
+  check("historical sales are dated from the file", ord9001?.placedAt.toISOString().startsWith("2026-10-01") === true);
+
+  const [ord9003] = await db
+    .select()
+    .from(orders)
+    .where(eq(orders.reference, "ORD-9003"));
+  // Revenue correctness: cancelled orders are excluded from the sales report,
+  // so mislabelling one inflates the number a shop is shown.
+  check("a voided order maps to cancelled", ord9003?.status === "cancelled", ord9003?.status);
+
+  // Re-importing the same file must update, not duplicate.
+  const reimport = await importCsv(tenant.id, wideCsv, "orders", { dryRun: false });
+  check("re-importing updates rather than duplicating", reimport.updated === 3 && reimport.created === 0);
+  const orderCount = await db.select().from(orders).where(eq(orders.reference, "ORD-9001"));
+  check("the row count is unchanged after a re-import", orderCount.length === 1);
+
+  // A long export: one row per line item, reference repeated, no total column.
+  const longCsv = [
+    "order_ref,placed_on,sku,name,qty,price",
+    "ORD-9100,2026-10-03,SUG-1KG,Granulated sugar,2,6250",
+    "ORD-9100,2026-10-03,BLUE-N,Blue Naise,1,8000",
+    "ORD-9101,2026-10-03,TEA-400,Beans,4,1000",
+  ].join("\n");
+
+  const longCommit = await importCsv(tenant.id, longCsv, "orders", { dryRun: false });
+  check("a long export collapses to one row per order", longCommit.created === 2, JSON.stringify(longCommit));
+
+  const [ord9100] = await db.select().from(orders).where(eq(orders.reference, "ORD-9100"));
+  // 2 x 6250 + 1 x 8000 = 20500
+  check(
+    "a total is derived from the line items when the file has none",
+    ord9100?.totalMinor === 2_050_000,
+    String(ord9100?.totalMinor),
+  );
+
+  const lineCount = await db
+    .select()
+    .from(orderItems)
+    .where(eq(orderItems.orderId, ord9100!.id));
+  check("both line items are stored", lineCount.length === 2, String(lineCount.length));
+  check(
+    "line items link to the catalogue by SKU",
+    lineCount.every((l) => l.productId !== null),
+  );
+  check(
+    "line items snapshot the product name",
+    lineCount.some((l) => l.description.toLowerCase().includes("blue")),
+  );
+
+  // Structural errors block a commit outright.
+  const badCsv = "order_ref,placed_on,amount\n,2026-10-01,5000";
+  const badResult = await importCsv(tenant.id, badCsv, "orders", { dryRun: false });
+  check("a row with no reference is an error", badResult.errors.length === 1);
+  check("the error names the row and the field", badResult.errors[0]?.field === "order_ref" && badResult.errors[0]?.row === 2);
+  const blockedCount = await db.select().from(orders).where(eq(orders.reference, "ORD-9003"));
+  check("an erroneous file creates nothing", blockedCount.length === 1);
+
+  const badStatus = "order_ref,placed_on,amount,status\nORD-9200,2026-10-01,500,teleported";
+  const badStatusResult = await importCsv(tenant.id, badStatus, "orders", { dryRun: true });
+  check(
+    "an unrecognised status is an error rather than a guess",
+    badStatusResult.errors.some((e) => e.field === "status"),
+    JSON.stringify(badStatusResult.errors),
+  );
+
+  // Undated history must not silently flatter the report.
+  const undated = "order_ref,amount\nORD-9300,4200";
+  const undatedResult = await importCsv(tenant.id, undated, "orders", { dryRun: true });
+  check(
+    "an order with no date warns that it was recorded as today",
+    undatedResult.warnings.some((w) => w.includes("no date")),
+    JSON.stringify(undatedResult.warnings),
+  );
+
+  // The reason this importer exists.
+  const seededTotals = await currentTotals(tenant.id);
+  check("order totals are now counted alongside products", typeof seededTotals.orders === "number" && seededTotals.orders > 0);
+
+  // Clean up so the suite stays re-runnable.
+  for (const ref of ["ORD-9001", "ORD-9002", "ORD-9003", "ORD-9100", "ORD-9101"]) {
+    const [row] = await db.select({ id: orders.id }).from(orders).where(eq(orders.reference, ref));
+    if (row) await db.delete(orderItems).where(eq(orderItems.orderId, row.id));
+    await db.delete(orders).where(eq(orders.reference, ref));
+  }
   console.log(`\n${passed} passed, ${failed} failed\n`);
   process.exit(failed > 0 ? 1 : 0);
 }

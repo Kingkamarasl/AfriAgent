@@ -136,20 +136,40 @@ function appUrl(path: string): string {
   return `${base.replace(/\/$/, "")}${path}`;
 }
 
-async function sendVerificationEmail(userId: string, businessName: string) {
+/**
+ * Issues a verification email.
+ *
+ * Returns whether it was actually dispatched, so callers can tell the difference
+ * between "check your inbox" and "the mail never left". Both callers currently
+ * have to treat a failure as retryable rather than silently claim success.
+ */
+async function sendVerificationEmail(
+  userId: string,
+  businessName: string,
+): Promise<boolean> {
   const db = await getDb();
   const [user] = await db
     .select({ email: users.email })
     .from(users)
     .where(eq(users.id, userId))
     .limit(1);
-  if (!user?.email) return;
+  if (!user?.email) return false;
 
   const token = await createAuthToken(userId, "verify_email");
-  await sendEmail({
+  const result = await sendEmail({
     ...verificationEmail(businessName, appUrl(`/verify-email?token=${token}`)),
     to: user.email,
   });
+
+  // The token now exists but may never arrive. Logged loudly because this is
+  // the failure mode where an owner is locked out of password reset with no
+  // visible cause.
+  if (!result.dispatched) {
+    console.error(
+      `[auth] verification email NOT dispatched for ${userId} (${result.detail ?? "no detail"})`,
+    );
+  }
+  return result.dispatched;
 }
 
 export async function resendVerificationAction(): Promise<AuthFormState> {
@@ -212,10 +232,19 @@ export async function forgotPasswordAction(
     // with someone else's address, then reset their way in.
     if (user.verifiedAt) {
       const token = await createAuthToken(user.id, "password_reset");
-      await sendEmail({
+      const result = await sendEmail({
         ...passwordResetEmail(appUrl(`/reset-password?token=${token}`)),
         to: user.email,
       });
+      // This is the worst failure in the app: a reset token exists, the owner
+      // is shown "check your email", and nothing ever arrives. They are locked
+      // out with no way to tell why. Logged as an error so it is visible.
+      if (!result.dispatched) {
+        console.error(
+          `[auth] password reset email NOT dispatched for ${user.id} ` +
+            `(${result.detail ?? "no detail"}) -- owner is locked out`,
+        );
+      }
     } else {
       // Unverified: do not send, but do not say so either.
       console.warn(

@@ -7,7 +7,6 @@ import {
   tasks,
   tenants,
   users,
-  whatsappLinks,
   type Task,
   type Tenant,
 } from "@/db/schema";
@@ -19,6 +18,7 @@ import {
   type SendResult,
 } from "@/lib/whatsapp/client";
 import type { TemplateSend } from "@/lib/whatsapp/templates";
+import { getLinkForPhoneNumber } from "@/lib/whatsapp/links";
 import {
   normalisePhone,
   resolveSenderRole,
@@ -381,19 +381,21 @@ async function resolveTenant(ctx: InboundContext): Promise<Tenant | null> {
 
   // Production: Meta tells us which number the message arrived on, and that
   // number is bound to exactly one business. This is the authoritative path.
+  //
+  // The binding lookup itself lives in `lib/whatsapp/links` so there is exactly
+  // one definition of "which shop does this number belong to". A second copy
+  // here is how a message gets routed to the wrong tenant, and that class of bug
+  // has already bitten this codebase twice.
   if (ctx.phoneNumberId) {
-    const [row] = await db
-      .select({ tenant: tenants })
-      .from(whatsappLinks)
-      .innerJoin(tenants, eq(whatsappLinks.tenantId, tenants.id))
-      .where(
-        and(
-          eq(whatsappLinks.phoneNumberId, ctx.phoneNumberId),
-          eq(whatsappLinks.isActive, true),
-        ),
-      )
+    const link = await getLinkForPhoneNumber(ctx.phoneNumberId);
+    if (!link) return null;
+
+    const [tenant] = await db
+      .select()
+      .from(tenants)
+      .where(eq(tenants.id, link.tenantId))
       .limit(1);
-    return row?.tenant ?? null;
+    return tenant ?? null;
   }
 
   // Simulator: the caller supplies the tenant taken from its own verified

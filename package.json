@@ -13,7 +13,8 @@
     "db:migrate": "tsx src/db/migrate-script.ts",
     "db:seed": "tsx src/db/seed.ts",
     "db:studio": "drizzle-kit studio",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "ai:check": "tsx scripts/check-ai.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.8",

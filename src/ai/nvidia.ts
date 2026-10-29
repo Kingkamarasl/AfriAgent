@@ -22,6 +22,7 @@ import {
 
 const DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_THINKING_PARAM = "enable_thinking";
 
 interface ChatCompletionResponse {
   choices?: Array<{
@@ -44,6 +45,36 @@ export interface NvidiaOptions {
   model: string;
   baseUrl?: string;
   timeoutMs?: number;
+  /**
+   * How to turn off "detailed thinking" when tools are present.
+   *
+   * NVIDIA documents that tool calling on the Nemotron families only works with
+   * thinking disabled -- the model reasons about the tool call instead of
+   * emitting it. The kwarg name is not consistent across model families, so it
+   * is configurable rather than guessed:
+   *
+   *   "enable_thinking"  Qwen3 and the Nemotron templates (default)
+   *   "thinking"         GLM-style templates
+   *   ""                 send nothing at all
+   *
+   * The live check (`npm run ai:check`) reports which one the configured model
+   * accepts, so this does not have to be guessed in advance.
+   */
+  thinkingParam?: string;
+}
+
+/**
+ * Chat-template kwargs are how vLLM models are told to skip reasoning.
+ *
+ * Sent only alongside tools: with no tools in play, thinking costs latency and
+ * the model's reasoning is harmless.
+ */
+export function buildChatTemplateKwargs(
+  thinkingParam: string,
+  hasTools: boolean,
+): { chat_template_kwargs: Record<string, boolean> } | null {
+  if (!hasTools || !thinkingParam) return null;
+  return { chat_template_kwargs: { [thinkingParam]: false } };
 }
 
 export class NvidiaProvider implements Provider {
@@ -57,6 +88,10 @@ export class NvidiaProvider implements Provider {
 
   private get timeoutMs(): number {
     return this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  }
+
+  private get thinkingParam(): string {
+    return this.options.thinkingParam ?? DEFAULT_THINKING_PARAM;
   }
 
   async health(): Promise<{ ok: boolean; detail?: string }> {
@@ -82,6 +117,8 @@ export class NvidiaProvider implements Provider {
   }
 
   async complete(req: CompletionRequest): Promise<CompletionResult> {
+    const thinking = buildChatTemplateKwargs(this.thinkingParam, Boolean(req.tools?.length));
+
     const body = {
       model: this.options.model,
       messages: req.messages.map(toWireMessage),
@@ -90,6 +127,7 @@ export class NvidiaProvider implements Provider {
       temperature: req.temperature ?? 0.1,
       max_tokens: req.maxTokens ?? 400,
       ...(req.tools?.length ? { tools: req.tools, tool_choice: "auto" } : {}),
+      ...(thinking ? { extra_body: thinking } : {}),
     };
 
     const timeout = AbortSignal.timeout(this.timeoutMs);

@@ -1,0 +1,7 @@
+order_ref,placed_on,sku,name,qty,price,status,wa_id
+ORD-9100,2026-10-03,SUG-1KG,Granulated sugar 1kg,2,1450,paid,2348020000002
+ORD-9100,2026-10-03,BLUE-N,Blue Naise powder 2kg,1,5900,paid,2348020000002
+ORD-9101,2026-10-03,TEA-400,Tea bags 100s,4,3800,delivered,2348020000003
+ORD-9102,2026-10-04,SALT-1KG,Salt 1kg,10,400,paid,
+ORD-9103,04/10/2026,BREAD-1,Bread loaf,6,650,complete,2348020000004
+ORD-9104,2026-10-05,COCA-1.5,Soft drink 1.5L,12,750,cancelled,2348020000005

@@ -172,7 +172,7 @@ export async function answerCustomerQuestion(
           degraded: false,
         },
       }
-    : resolveProvider();
+    : await resolveProvider();
 
   const base: AnswerOutcome = {
     verdict: "escalate",

@@ -145,6 +145,10 @@ export async function seed() {
     businessPhone: OWNER_WA_ID,
     displayName: "Ojota Mini Market",
     isSimulated: true,
+    // Not the `pending` default: this number works, it just never reaches Meta.
+    // Leaving it pending makes the demo shop read as half-onboarded.
+    status: "active",
+    mode: "self_provisioned",
   });
 
   const productRows = await db
