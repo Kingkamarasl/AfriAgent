@@ -58,7 +58,7 @@ tests, and a production build in a clean environment before deployment.
 ## Quick start
 
 ```bash
-npm install
+npm ci
 npm run db:seed     # migrations + a demo Lagos shop with a week of trading
 npm run dev         # http://localhost:3000
 ```
@@ -91,7 +91,7 @@ cookie.
 Run the guarantees end to end:
 
 ```bash
-npm run smoke      # 46 assertions, re-runnable
+npm run smoke      # re-runnable; run after db:seed
 ```
 
 ## Zero-setup dev
@@ -587,7 +587,9 @@ platform-admin surface for AI credentials.
   does not take money. Mobile-money integration is deliberately out of scope.
 - **Rate card is a starting point.** Tune against real LLM + WhatsApp costs
   before quoting anyone.
-- **No CI.** Typecheck, lint, smoke and build are run by hand.
+- **CI is configured** in `.github/workflows/ci.yml`: pull requests and pushes
+  to `main` run typecheck, lint, migrations, seeding, the smoke suite twice, and
+  a production build. See [Contributing](CONTRIBUTING.md) for the local workflow.
 
 ## Suggested next steps
 

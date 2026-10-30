@@ -61,12 +61,7 @@ export function Playground() {
       </header>
 
       <div className="mb-3 flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800">
-        {(
-          [
-            ["owner", OWNER_WA_ID],
-            ["customer", CUSTOMER_WA_ID],
-          ] as const
-        ).map(([label, waId]) => (
+        {(["owner", "customer"] as const).map((label) => (
           <button
             key={label}
             onClick={() => setAsOwner(label === "owner")}
