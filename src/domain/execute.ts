@@ -163,10 +163,7 @@ export async function runSalesReport(tenantId: string): Promise<TaskResult> {
 /* invoice_reminder                                                     */
 /* ------------------------------------------------------------------ */
 
-export async function runInvoiceReminder(
-  tenantId: string,
-  task: Task,
-): Promise<TaskResult> {
+export async function runInvoiceReminder(tenantId: string): Promise<TaskResult> {
   const { db, tenant } = await tenantCtx(tenantId);
   const now = new Date();
 
@@ -316,7 +313,7 @@ export async function runDailySummary(tenantId: string): Promise<TaskResult> {
   const [sales, low, chasing] = await Promise.all([
     runSalesReport(tenantId),
     runLowStock(tenantId),
-    runInvoiceReminder(tenantId, {} as Task),
+    runInvoiceReminder(tenantId),
   ]);
 
   const body = [
@@ -435,7 +432,7 @@ export async function executeTask(task: Task): Promise<TaskResult> {
     case "sales_report":
       return runSalesReport(task.tenantId);
     case "invoice_reminder":
-      return runInvoiceReminder(task.tenantId, task);
+      return runInvoiceReminder(task.tenantId);
     case "low_stock":
       return runLowStock(task.tenantId);
     case "daily_summary":

@@ -1,7 +1,6 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { getDb } from "@/db/client";
 import { getCurrentActor } from "@/lib/auth/session";
 import { handleInboundMessage, sendTask } from "@/domain/pipeline";
 import {

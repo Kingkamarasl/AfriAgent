@@ -1,4 +1,4 @@
-import { ProviderError, type CompletionRequest, type CompletionResult, type Provider, type ToolCall } from "./provider";
+import { ProviderError, type CompletionResult, type Provider, type ToolCall } from "./provider";
 
 /**
  * A scripted provider.
@@ -30,7 +30,7 @@ export class ScriptedProvider implements Provider {
     return { ok: true };
   }
 
-  async complete(_req: CompletionRequest): Promise<CompletionResult> {
+  async complete(): Promise<CompletionResult> {
     const round = this.script[this.callCount] ?? { content: "" };
     this.callCount++;
 

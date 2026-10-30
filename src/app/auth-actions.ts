@@ -95,12 +95,12 @@ export async function registerAction(_previous: AuthFormState, formData: FormDat
 export async function loginAction(_previous: AuthFormState, formData: FormData): Promise<AuthFormState> {
   const email = normaliseEmail(formData.get("email"));
   const password = String(formData.get("password") ?? "");
-  const ip = clientIp();
+  const ip = await clientIp();
   if (!emailPattern.test(email) || !password || password.length > 128) return { error: "Enter your email and password." };
 
   // Checked before any credential work, so a throttled attempt costs one
   // indexed count rather than 310k PBKDF2 iterations.
-  const throttle = await checkLoginThrottle({ email, ip: await clientIp() });
+  const throttle = await checkLoginThrottle({ email, ip });
   if (throttle.blocked) {
     const minutes = Math.ceil((throttle.retryAfterSeconds ?? 60) / 60);
     return {
@@ -115,13 +115,13 @@ export async function loginAction(_previous: AuthFormState, formData: FormData):
   const passwordOk = await verifyPasswordWithFallback(password, user?.passwordHash);
   const ok = Boolean(user && passwordOk);
 
-  await recordLoginAttempt({ email, ip: await clientIp(), succeeded: ok });
+  await recordLoginAttempt({ email, ip, succeeded: ok });
 
   if (!ok) return { error: "Email or password is incorrect." };
 
   // A success clears the counters, so a few fumbled attempts followed by a
   // correct sign-in does not leave someone one typo from a lockout.
-  await clearLoginAttempts({ email, ip: await clientIp() });
+  await clearLoginAttempts({ email, ip });
   await createSession(user!.id);
   revalidatePath("/");
   redirect("/");

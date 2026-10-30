@@ -43,7 +43,7 @@ import { parseCsv } from "../src/lib/csv";
 import { verifyPassword, verifyPasswordWithFallback } from "../src/lib/auth/password";
 import { purgeExpiredSessions } from "../src/lib/auth/maintenance";
 import { DEMO_PASSWORD } from "../src/lib/auth/demo";
-import { answerCustomerQuestion, dayKey, tokensUsedToday } from "../src/ai/answer";
+import { answerCustomerQuestion, dayKey } from "../src/ai/answer";
 import { evaluateGrounding } from "../src/ai/ground";
 import { runTool, type ToolFact } from "../src/ai/tools";
 import { hallucinatingPriceProvider, ScriptedProvider } from "../src/ai/scripted";

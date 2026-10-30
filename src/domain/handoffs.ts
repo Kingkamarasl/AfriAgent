@@ -174,7 +174,6 @@ export async function listHandoffs(
 
 /** Count for the nav badge. */
 export async function openHandoffCount(tenantId: string): Promise<number> {
-  const db = await getDb();
   const rows = await listHandoffs(tenantId);
   return rows.length;
 }

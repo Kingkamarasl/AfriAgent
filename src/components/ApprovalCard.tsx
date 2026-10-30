@@ -7,7 +7,6 @@ import {
   reviseDraftAction,
 } from "@/app/actions";
 import type { Task } from "@/db/schema";
-import { formatMoney } from "@/lib/money";
 
 /**
  * The approval gate.
